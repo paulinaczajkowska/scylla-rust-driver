@@ -765,7 +765,7 @@ fn serialize_udt<'b>(
         .map_err(|_| mk_ser_err::<CqlValue>(typ, BuiltinSerializationErrorKind::SizeOverflow))
 }
 
-fn serialize_tuple_like<'t, 'b>(
+pub fn serialize_tuple_like<'t, 'b>(
     typ: &ColumnType,
     field_types: impl Iterator<Item = &'t ColumnType<'t>>,
     field_values: impl Iterator<Item = &'t Option<CqlValue>>,
