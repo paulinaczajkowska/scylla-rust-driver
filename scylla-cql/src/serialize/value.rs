@@ -973,7 +973,7 @@ fn serialize_next_variable_length_elem<'t, T: SerializeValue + 't>(
     Ok(())
 }
 
-fn serialize_vector<'t, 'b, T: SerializeValue + 't>(
+pub fn serialize_vector<'t, 'b, T: SerializeValue + 't>(
     rust_name: &'static str,
     len: usize,
     iter: impl Iterator<Item = &'t T>,
