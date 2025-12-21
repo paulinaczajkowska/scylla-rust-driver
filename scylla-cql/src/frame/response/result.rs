@@ -1520,7 +1520,7 @@ mod test_utils {
         }
 
         /// Returns the size of the type in bytes, as it is seen by the vector type if it is treated as fixed size.
-        pub(crate) fn type_size(&self) -> Option<usize> {
+        pub fn type_size(&self) -> Option<usize> {
             match self {
                 ColumnType::Native(n) => n.type_size(),
                 ColumnType::Tuple(_) => None,
