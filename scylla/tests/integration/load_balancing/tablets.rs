@@ -48,7 +48,7 @@ async fn get_tablets(session: &Session, ks: &str, table: &str) -> Vec<Tablet> {
     }
 
     let selected_tablets_response = session.query_iter(
-        "select last_token, replicas from system.tablets WHERE keyspace_name = ? and table_name = ? ALLOW FILTERING",
+        "SELECT last_token, replicas FROM system.tablets WHERE keyspace_name = ? AND table_name = ? ALLOW FILTERING",
         &(ks, table)).await.unwrap();
 
     let mut selected_tablets: Vec<SelectedTablet> = selected_tablets_response
@@ -58,7 +58,7 @@ async fn get_tablets(session: &Session, ks: &str, table: &str) -> Vec<Tablet> {
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
-    selected_tablets.sort_unstable_by(|a, b| a.last_token.cmp(&b.last_token));
+    selected_tablets.sort_unstable_by_key(|a| a.last_token);
 
     let (tablets, _) = selected_tablets.iter().fold(
         (Vec::new(), i64::MIN),
@@ -287,7 +287,6 @@ async fn run_test_default_policy_is_tablet_aware_attempt(
 /// After that we know we have all the info. The test sends the same insert request
 /// per tablet, this time using DefaultPolicy, and expects to not get any feedbacks.
 #[tokio::test]
-#[ntest::timeout(30000)]
 async fn test_default_policy_is_tablet_aware() {
     setup_tracing();
     const TABLET_COUNT: usize = 16;
@@ -379,7 +378,6 @@ async fn test_default_policy_is_tablet_aware() {
 /// The test sends a query to each shard of every node and verifies that no
 /// tablet info was sent in response.
 #[tokio::test]
-#[ntest::timeout(30000)]
 async fn test_tablet_feedback_not_sent_for_unprepared_queries() {
     setup_tracing();
     const TABLET_COUNT: usize = 16;
@@ -452,7 +450,6 @@ async fn test_tablet_feedback_not_sent_for_unprepared_queries() {
 ///
 /// TODO: Remove #[ignore] once LWTs are supported with tablets.
 #[tokio::test]
-#[ntest::timeout(30000)]
 #[ignore]
 async fn test_lwt_optimization_works_with_tablets() {
     setup_tracing();

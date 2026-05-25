@@ -5,6 +5,7 @@ use super::execution_profile::{ExecutionProfile, ExecutionProfileHandle, Executi
 use super::pager::{PreparedPagerConfig, QueryPager};
 use super::{Compression, PoolSize, SelfIdentity, WriteCoalescingDelay};
 use crate::authentication::AuthenticatorProvider;
+use crate::client::client_routes::ClientRoutesConfig;
 use crate::cluster::node::{KnownNode, NodeRef};
 use crate::cluster::{Cluster, ClusterNeatDebug, ClusterState};
 use crate::errors::{
@@ -14,7 +15,9 @@ use crate::errors::{
 };
 use crate::frame::response::result;
 use crate::network::tls::TlsProvider;
-use crate::network::{Connection, ConnectionConfig, PoolConfig, VerifiedKeyspaceName};
+use crate::network::{
+    Connection, ConnectionConfig, PoolConfig, TcpSocketOptions, VerifiedKeyspaceName,
+};
 use crate::observability::driver_tracing::RequestSpan;
 use crate::observability::history::{self, HistoryListener};
 #[cfg(feature = "metrics")]
@@ -23,6 +26,9 @@ use crate::observability::tracing::TracingInfo;
 use crate::policies::address_translator::AddressTranslator;
 use crate::policies::host_filter::HostFilter;
 use crate::policies::load_balancing::{self, RoutingInfo};
+use crate::policies::reconnect::ExponentialReconnectPolicy;
+#[cfg(all(scylla_unstable, feature = "unstable-reconnect-policy"))]
+use crate::policies::reconnect::ReconnectPolicy;
 use crate::policies::retry::{RequestInfo, RetryDecision, RetrySession};
 use crate::policies::speculative_execution;
 use crate::policies::timestamp_generator::TimestampGenerator;
@@ -41,22 +47,40 @@ use arc_swap::ArcSwapOption;
 use futures::future::join_all;
 use futures::future::try_join_all;
 use itertools::Itertools;
-use scylla_cql::frame::response::NonErrorResponseWithDeserializedMetadata;
+use scylla_cql::frame::response::NonErrorResponseWithDeserializedMetadataV2 as NonErrorResponseWithDeserializedMetadata;
+use scylla_cql::frame::response::error::DbError;
 use scylla_cql::serialize::batch::BatchValues;
 use scylla_cql::serialize::row::{SerializeRow, SerializedValues};
 use std::borrow::Borrow;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::ops::ControlFlow;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use thiserror::Error;
 use tokio::time::timeout;
 use tracing::{Instrument, debug, error, trace, trace_span};
 use uuid::Uuid;
 
 pub(crate) const TABLET_CHANNEL_SIZE: usize = 8192;
 
-const TRACING_QUERY_PAGE_SIZE: i32 = 1024;
+// Query used for schema agreement checks
+const SCHEMA_VERSION_QUERY_STR: &str = "SELECT schema_version FROM system.local WHERE key='local'";
+
+/// Statements for internal driver operations.
+///
+/// We would like those to be prepared, but there are issues related to
+/// changing connection keyspace: https://github.com/scylladb/scylla-rust-driver/issues/1561
+#[derive(Default)]
+struct InternalStatements {
+    /// Statement for querying tracing session info from system_traces.sessions
+    tracing_session: OnceLock<Statement>,
+    /// Statement for querying tracing events from system_traces.events
+    tracing_events: OnceLock<Statement>,
+    /// Statement for fetching schema version during schema agreement checks
+    schema_version: OnceLock<Statement>,
+}
 
 /// `Session` manages connections to the cluster and allows to execute CQL requests.
 pub struct Session {
@@ -72,6 +96,7 @@ pub struct Session {
     tracing_info_fetch_attempts: NonZeroU32,
     tracing_info_fetch_interval: Duration,
     tracing_info_fetch_consistency: Consistency,
+    internal_statements: InternalStatements,
 }
 
 /// This implementation deliberately omits some details from Cluster in order
@@ -180,6 +205,23 @@ pub struct SessionConfig {
     /// If `None`, no TCP keepalive messages are sent.
     pub tcp_keepalive_interval: Option<Duration>,
 
+    /// Size of the TCP receive buffer in bytes.
+    /// If `None`, the OS default is used.
+    pub tcp_recv_buffer_size: Option<usize>,
+
+    /// Size of the TCP send buffer in bytes.
+    /// If `None`, the OS default is used.
+    pub tcp_send_buffer_size: Option<usize>,
+
+    /// Whether to set the `SO_REUSEADDR` socket option.
+    /// If `None`, the OS default is used (typically `false`).
+    pub tcp_reuse_address: Option<bool>,
+
+    /// Linger duration for the socket.
+    /// If `None`, the OS default is used (lingering disabled).
+    /// Setting this to `Some(Duration::ZERO)` causes the connection to be reset (RST) on close.
+    pub tcp_linger: Option<Duration>,
+
     /// Handle to the default execution profile, which is used
     /// for all statements that do not specify an execution profile.
     pub default_execution_profile_handle: ExecutionProfileHandle,
@@ -215,6 +257,11 @@ pub struct SessionConfig {
     /// If true, prevents the driver from connecting to the shard-aware port, even if the node supports it.
     /// Generally, this options is best left as default (false).
     pub disallow_shard_aware_port: bool,
+
+    /// Policy that determines how long the connection pool waits between attempts
+    /// to fill connections to given host.
+    #[cfg(all(scylla_unstable, feature = "unstable-reconnect-policy"))]
+    pub reconnect_policy: Arc<dyn ReconnectPolicy>,
 
     ///  Timestamp generator used for generating timestamps on the client-side
     ///  If None, server-side timestamps are used.
@@ -263,10 +310,19 @@ pub struct SessionConfig {
     /// between the nodes and the driver.
     pub address_translator: Option<Arc<dyn AddressTranslator>>,
 
+    /// Routing configuration for Scylla Cloud. If set, Session will connect
+    /// to Scylla Cloud clusters using custom routing based on `system.client_routes`.
+    #[cfg(feature = "unstable-client-routes")]
+    pub(crate) client_routes_config: Option<super::client_routes::ClientRoutesConfig>,
+
     /// The host filter decides whether any connections should be opened
     /// to the node or not. The driver will also avoid filtered out nodes when
     /// re-establishing the control connection.
     pub host_filter: Option<Arc<dyn HostFilter>>,
+
+    #[cfg(all(scylla_unstable, feature = "unstable-host-listener"))]
+    /// Optional listener for host events (ADD, REMOVE, UP, DOWN).
+    pub host_listener: Option<Arc<dyn crate::policies::host_listener::HostListener>>,
 
     /// If true, the driver will inject a delay controlled by [`SessionConfig::write_coalescing_delay`]
     /// before flushing data to the socket.
@@ -333,6 +389,10 @@ impl SessionConfig {
             compression: None,
             tcp_nodelay: true,
             tcp_keepalive_interval: None,
+            tcp_recv_buffer_size: None,
+            tcp_send_buffer_size: None,
+            tcp_reuse_address: None,
+            tcp_linger: None,
             schema_agreement_interval: Duration::from_millis(200),
             default_execution_profile_handle: ExecutionProfile::new_from_inner(Default::default())
                 .into_handle(),
@@ -344,6 +404,8 @@ impl SessionConfig {
             hostname_resolution_timeout: Some(Duration::from_secs(5)),
             connection_pool_size: Default::default(),
             disallow_shard_aware_port: false,
+            #[cfg(all(scylla_unstable, feature = "unstable-reconnect-policy"))]
+            reconnect_policy: Arc::new(ExponentialReconnectPolicy::new()),
             timestamp_generator: None,
             keyspaces_to_fetch: Vec::new(),
             fetch_schema_metadata: true,
@@ -354,6 +416,8 @@ impl SessionConfig {
             schema_agreement_automatic_waiting: true,
             address_translator: None,
             host_filter: None,
+            #[cfg(all(scylla_unstable, feature = "unstable-host-listener"))]
+            host_listener: None,
             refresh_metadata_on_auto_schema_agreement: true,
             enable_write_coalescing: true,
             write_coalescing_delay: WriteCoalescingDelay::SmallNondeterministic,
@@ -362,6 +426,8 @@ impl SessionConfig {
             tracing_info_fetch_consistency: Consistency::One,
             cluster_metadata_refresh_interval: Duration::from_secs(60),
             identity: SelfIdentity::default(),
+            #[cfg(feature = "unstable-client-routes")]
+            client_routes_config: None,
         }
     }
 
@@ -431,6 +497,39 @@ impl SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SessionConfig {
+    /// [SessionConfig] may unfortunately represent invalid configurations. We need to rule them out
+    /// at runtime by running validation.
+    #[expect(clippy::result_large_err)] // TODO(2.0): Make NewSessionError smaller.
+    fn validate(&self) -> Result<(), NewSessionError> {
+        // Ensure there is at least one known node
+        if self.known_nodes.is_empty() {
+            return Err(NewSessionError::EmptyKnownNodesList);
+        }
+
+        // Ensure no illegal configuration with Client Routes
+        #[cfg(feature = "unstable-client-routes")]
+        if self.client_routes_config.is_some() {
+            if self.address_translator.is_some() {
+                return Err(NewSessionError::IllegalConfig(
+                    "User-provided address translator is not supported if ClientRoutesConfig is provided, \
+                        because the driver uses its own custom translator for client routes".into(),
+                ));
+            }
+
+            if self.tls_context.is_some() {
+                return Err(NewSessionError::IllegalConfig(
+                    "TLS is not (yet) supported if ClientRoutesConfig is provided, \
+                        because of architectural limitations that are out of the driver's scope"
+                        .into(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -659,7 +758,19 @@ impl Session {
         prepared: &PreparedStatement,
         values: impl SerializeRow,
     ) -> Result<QueryResult, ExecutionError> {
-        self.do_execute_unpaged(prepared, values).await
+        let serialized_values = prepared.serialize_values(&values)?;
+        let (result, paging_state) = self
+            .execute(prepared, &serialized_values, None, PagingState::start())
+            .await?;
+        if !paging_state.finished() {
+            error!(
+                "Unpaged prepared query returned a non-empty paging state! This is a driver-side or server-side bug."
+            );
+            return Err(ExecutionError::LastAttemptError(
+                RequestAttemptError::NonfinishedPagingState,
+            ));
+        }
+        Ok(result)
     }
 
     /// Executes a prepared statement, restricting results to single page.
@@ -724,7 +835,9 @@ impl Session {
         values: impl SerializeRow,
         paging_state: PagingState,
     ) -> Result<(QueryResult, PagingStateResponse), ExecutionError> {
-        self.do_execute_single_page(prepared, values, paging_state)
+        let serialized_values = prepared.serialize_values(&values)?;
+        let page_size = prepared.get_validated_page_size();
+        self.execute(prepared, &serialized_values, Some(page_size), paging_state)
             .await
     }
 
@@ -772,7 +885,11 @@ impl Session {
         prepared: impl Into<PreparedStatement>,
         values: impl SerializeRow,
     ) -> Result<QueryPager, PagerExecutionError> {
-        self.do_execute_iter(prepared.into(), values).await
+        let prepared = prepared.into();
+        let serialized_values = prepared.serialize_values(&values)?;
+
+        self.execute_iter_nongeneric(prepared, serialized_values)
+            .await
     }
 
     /// Execute a batch statement\
@@ -825,7 +942,95 @@ impl Session {
         batch: &Batch,
         values: impl BatchValues,
     ) -> Result<QueryResult, ExecutionError> {
-        self.do_batch(batch, values).await
+        // Shard-awareness behavior for batch will be to pick shard based on first batch statement's shard
+        // If users batch statements by shard, they will be rewarded with full shard awareness
+
+        // check to ensure that we don't send a batch statement with more than u16::MAX queries
+        let batch_statements_length = batch.statements.len();
+        if batch_statements_length > u16::MAX as usize {
+            return Err(ExecutionError::BadQuery(
+                BadQuery::TooManyQueriesInBatchStatement(batch_statements_length),
+            ));
+        }
+
+        let execution_profile = batch
+            .get_execution_profile_handle()
+            .unwrap_or_else(|| self.get_default_execution_profile_handle())
+            .access();
+
+        let consistency = batch
+            .config
+            .consistency
+            .unwrap_or(execution_profile.consistency);
+
+        let serial_consistency = batch
+            .config
+            .serial_consistency
+            .unwrap_or(execution_profile.serial_consistency);
+
+        let (first_value_token, values) =
+            batch_values::peek_first_token(values, batch.statements.first())?;
+        let values_ref = &values;
+
+        let table_spec =
+            if let Some(BatchStatement::PreparedStatement(ps)) = batch.statements.first() {
+                ps.get_table_spec()
+            } else {
+                None
+            };
+
+        let statement_info = RoutingInfo {
+            consistency,
+            serial_consistency,
+            token: first_value_token,
+            table: table_spec,
+            is_confirmed_lwt: false,
+        };
+
+        let span = RequestSpan::new_batch();
+
+        let (run_request_result, coordinator): (
+            RunRequestResult<NonErrorQueryResponse>,
+            Coordinator,
+        ) = self
+            .run_request(
+                statement_info,
+                &batch.config,
+                execution_profile,
+                |connection: Arc<Connection>,
+                 consistency: Consistency,
+                 execution_profile: &ExecutionProfileInner| {
+                    let serial_consistency = batch
+                        .config
+                        .serial_consistency
+                        .unwrap_or(execution_profile.serial_consistency);
+                    async move {
+                        connection
+                            .batch_with_consistency(
+                                batch,
+                                values_ref,
+                                consistency,
+                                serial_consistency,
+                            )
+                            .await
+                            .and_then(QueryResponse::into_non_error_query_response)
+                    }
+                },
+                &span,
+            )
+            .instrument(span.span().clone())
+            .await?;
+
+        let result = match run_request_result {
+            RunRequestResult::IgnoredWriteError => QueryResult::mock_empty(coordinator),
+            RunRequestResult::Completed(non_error_query_response) => {
+                let result = non_error_query_response.into_query_result(coordinator)?;
+                span.record_result_fields(&result);
+                result
+            }
+        };
+
+        Ok(result)
     }
 
     /// Estabilishes a CQL session with the database
@@ -851,21 +1056,26 @@ impl Session {
     /// # }
     /// ```
     pub async fn connect(config: SessionConfig) -> Result<Self, NewSessionError> {
-        let known_nodes = config.known_nodes;
+        config.validate()?;
 
-        // Ensure there is at least one known node
-        if known_nodes.is_empty() {
-            return Err(NewSessionError::EmptyKnownNodesList);
-        }
+        let known_nodes = config.known_nodes;
 
         let (tablet_sender, tablet_receiver) = tokio::sync::mpsc::channel(TABLET_CHANNEL_SIZE);
 
         let tls_provider = if let Some(tls_context) = config.tls_context {
             // To silence warnings when TlsContext is an empty enum (tls features are disabled).
             // In such case, TlsProvider is uninhabited.
-            #[allow(unused_variables)]
+            #[cfg_attr(
+                not(any(feature = "openssl-010", feature = "rustls-023")),
+                // TODO: make this expect() once MSRV is 1.92+.
+                allow(unreachable_code, unused_variables)
+            )]
             let provider = TlsProvider::new_with_global_context(tls_context);
-            #[allow(unreachable_code)]
+            #[cfg_attr(
+                not(any(feature = "openssl-010", feature = "rustls-023")),
+                // TODO: remove this once MSRV is 1.92+.
+                allow(unreachable_code)
+            )]
             Some(provider)
         } else {
             None
@@ -875,8 +1085,14 @@ impl Session {
             local_ip_address: config.local_ip_address,
             shard_aware_local_port_range: config.shard_aware_local_port_range,
             compression: config.compression,
-            tcp_nodelay: config.tcp_nodelay,
-            tcp_keepalive_interval: config.tcp_keepalive_interval,
+            tcp_socket_options: TcpSocketOptions {
+                nodelay: config.tcp_nodelay,
+                keepalive_interval: config.tcp_keepalive_interval,
+                recv_buffer_size: config.tcp_recv_buffer_size,
+                send_buffer_size: config.tcp_send_buffer_size,
+                reuse_address: config.tcp_reuse_address,
+                linger: config.tcp_linger,
+            },
             timestamp_generator: config.timestamp_generator,
             tls_provider,
             authenticator: config.authenticator,
@@ -897,10 +1113,36 @@ impl Session {
             connection_config,
             pool_size: config.connection_pool_size,
             can_use_shard_aware_port: !config.disallow_shard_aware_port,
+            #[cfg(all(scylla_unstable, feature = "unstable-reconnect-policy"))]
+            reconnect_policy: config.reconnect_policy,
+            #[cfg(not(all(scylla_unstable, feature = "unstable-reconnect-policy")))]
+            reconnect_policy: Arc::new(ExponentialReconnectPolicy::new()),
         };
 
         #[cfg(feature = "metrics")]
         let metrics = Arc::new(Metrics::new());
+
+        let host_listener = {
+            #[cfg(all(scylla_unstable, feature = "unstable-host-listener"))]
+            {
+                config.host_listener
+            }
+            #[cfg(not(all(scylla_unstable, feature = "unstable-host-listener")))]
+            {
+                None
+            }
+        };
+
+        let client_routes_config: Option<ClientRoutesConfig> = {
+            #[cfg(feature = "unstable-client-routes")]
+            {
+                config.client_routes_config
+            }
+            #[cfg(not(feature = "unstable-client-routes"))]
+            {
+                None
+            }
+        };
 
         let cluster = Cluster::new(
             known_nodes,
@@ -910,10 +1152,12 @@ impl Session {
             config.metadata_request_serverside_timeout,
             config.hostname_resolution_timeout,
             config.host_filter,
+            host_listener,
             config.cluster_metadata_refresh_interval,
             tablet_receiver,
             #[cfg(feature = "metrics")]
             Arc::clone(&metrics),
+            client_routes_config,
         )
         .await?;
 
@@ -933,6 +1177,7 @@ impl Session {
             tracing_info_fetch_attempts: config.tracing_info_fetch_attempts,
             tracing_info_fetch_interval: config.tracing_info_fetch_interval,
             tracing_info_fetch_consistency: config.tracing_info_fetch_consistency,
+            internal_statements: InternalStatements::default(),
         };
 
         if let Some(keyspace_name) = config.used_keyspace {
@@ -942,6 +1187,40 @@ impl Session {
         }
 
         Ok(session)
+    }
+
+    /// Creates and returns ref to a shared statement for querying tracing session info.
+    fn get_tracing_session_statement(&self) -> &Statement {
+        self.internal_statements.tracing_session.get_or_init(|| {
+            let mut stmt = Statement::new(crate::observability::tracing::TRACES_SESSION_QUERY_STR);
+            stmt.set_page_size(crate::observability::tracing::TRACING_QUERY_PAGE_SIZE);
+            stmt.set_consistency(self.tracing_info_fetch_consistency);
+            stmt.set_is_idempotent(true);
+            stmt
+        })
+    }
+
+    /// Creates and returns ref to a shared statement for querying tracing events.
+    fn get_tracing_events_statement(&self) -> &Statement {
+        self.internal_statements.tracing_events.get_or_init(|| {
+            let mut stmt = Statement::new(crate::observability::tracing::TRACES_EVENTS_QUERY_STR);
+            stmt.set_page_size(crate::observability::tracing::TRACING_QUERY_PAGE_SIZE);
+            stmt.set_consistency(self.tracing_info_fetch_consistency);
+            stmt.set_is_idempotent(true);
+            stmt
+        })
+    }
+
+    /// Creates and returns ref to a shared statement for querying schema version.
+    fn get_schema_version_statement(&self) -> &Statement {
+        self.internal_statements.schema_version.get_or_init(|| {
+            let mut statement = Statement::new(SCHEMA_VERSION_QUERY_STR);
+            // Use ONE consistency for schema version queries - this is a local query
+            // that reads from system.local, so ONE is appropriate.
+            statement.set_consistency(Consistency::One);
+            statement.set_is_idempotent(true);
+            statement
+        })
     }
 
     async fn do_query_unpaged(
@@ -1087,7 +1366,7 @@ impl Session {
         Ok((result, paging_state_response))
     }
 
-    async fn handle_set_keyspace_response(
+    pub(crate) async fn handle_set_keyspace_response(
         &self,
         response: &NonErrorQueryResponse,
     ) -> Result<(), UseKeyspaceError> {
@@ -1102,21 +1381,41 @@ impl Session {
 
         Ok(())
     }
+}
 
-    async fn handle_auto_await_schema_agreement(
+#[derive(Debug, Error)]
+/// Errors that can occur during automatic awaiting of schema agreement after a schema change.
+pub(crate) enum AutoSchemaAwaitingError {
+    /// Schema agreement could not be reached.
+    #[error("Schema agreement could not be reached: {0}")]
+    SchemaAgreement(#[from] SchemaAgreementError),
+    /// Metadata refresh after reaching schema agreement failed.
+    #[error("Metadata refresh after reaching schema agreement failed: {0}")]
+    MetadataRefresh(#[from] MetadataError),
+}
+
+impl From<AutoSchemaAwaitingError> for ExecutionError {
+    fn from(err: AutoSchemaAwaitingError) -> Self {
+        match err {
+            AutoSchemaAwaitingError::SchemaAgreement(e) => e.into(),
+            AutoSchemaAwaitingError::MetadataRefresh(e) => e.into(),
+        }
+    }
+}
+
+impl Session {
+    pub(crate) async fn handle_auto_await_schema_agreement(
         &self,
         response: &NonErrorQueryResponse,
         coordinator_id: Uuid,
-    ) -> Result<(), ExecutionError> {
-        if self.schema_agreement_automatic_waiting {
-            if response.as_schema_change().is_some() {
-                self.await_schema_agreement_with_required_node(Some(coordinator_id))
-                    .await?;
-            }
+    ) -> Result<(), AutoSchemaAwaitingError> {
+        if self.schema_agreement_automatic_waiting && response.as_schema_change().is_some() {
+            debug!("Detected schema change, so awaiting schema agreement automatically...");
+            self.await_schema_agreement_with_required_node(Some(coordinator_id))
+                .await?;
+            debug!("Auto schema agreement awaiting: schema agreement reached.",);
 
-            if self.refresh_metadata_on_auto_schema_agreement
-                && response.as_schema_change().is_some()
-            {
+            if self.refresh_metadata_on_auto_schema_agreement {
                 self.refresh_metadata().await?;
             }
         }
@@ -1129,38 +1428,37 @@ impl Session {
         statement: Statement,
         values: impl SerializeRow,
     ) -> Result<QueryPager, PagerExecutionError> {
-        let execution_profile = statement
-            .get_execution_profile_handle()
-            .unwrap_or_else(|| self.get_default_execution_profile_handle())
-            .access();
-
         if values.is_empty() {
-            QueryPager::new_for_query(
-                statement,
-                execution_profile,
-                self.cluster.get_state(),
-                #[cfg(feature = "metrics")]
-                Arc::clone(&self.metrics),
-            )
-            .await
-            .map_err(PagerExecutionError::NextPageError)
+            self.do_query_iter_without_values(statement).await
         } else {
             // Making QueryPager::new_for_query work with values is too hard (if even possible)
             // so instead of sending one prepare to a specific connection on each iterator query,
             // we fully prepare a statement beforehand.
             let prepared = self.prepare_nongeneric(&statement).await?;
             let values = prepared.serialize_values(&values)?;
-            QueryPager::new_for_prepared_statement(PreparedPagerConfig {
-                prepared,
-                values,
-                execution_profile,
-                cluster_state: self.cluster.get_state(),
-                #[cfg(feature = "metrics")]
-                metrics: Arc::clone(&self.metrics),
-            })
-            .await
-            .map_err(PagerExecutionError::NextPageError)
+            self.execute_iter_nongeneric(prepared, values).await
         }
+    }
+
+    /// `Session::query_iter` specialization for empty values.
+    async fn do_query_iter_without_values(
+        &self,
+        statement: Statement,
+    ) -> Result<QueryPager, PagerExecutionError> {
+        let execution_profile = statement
+            .get_execution_profile_handle()
+            .unwrap_or_else(|| self.get_default_execution_profile_handle())
+            .access();
+
+        QueryPager::new_for_query(
+            self,
+            statement,
+            execution_profile,
+            self.cluster.get_state(),
+            #[cfg(feature = "metrics")]
+            Arc::clone(&self.metrics),
+        )
+        .await
     }
 
     /// Prepares a statement on the server side and returns a prepared statement,
@@ -1173,10 +1471,26 @@ impl Session {
     /// * Database doesn't need to parse the statement string upon each execution (only once)
     /// * They are properly load balanced using token aware routing
     ///
-    /// > ***Warning***\
-    /// > For token/shard aware load balancing to work properly, all partition key values
-    /// > must be sent as bound values
-    /// > (see [performance section](https://rust-driver.docs.scylladb.com/stable/statements/prepared.html#performance))
+    /// <div class="warning">
+    ///
+    /// **Warning!**
+    ///
+    /// **Prepare a statement once** (e.g., store it in a variable, static, or struct field),
+    /// then **execute it multiple times** with different values.
+    /// Do **NOT** call `prepare()` repeatedly for the same statement before each execution -
+    /// this defeats the purpose of prepared statements and significantly degrades performance.
+    ///
+    /// </div>
+    ///
+    /// <div class="warning">
+    ///
+    /// **Warning!**
+    ///
+    /// For token/shard aware load balancing to work properly, all partition key values
+    /// must be sent as bound values
+    /// (see [performance section](https://rust-driver.docs.scylladb.com/stable/statements/prepared.html#performance))
+    ///
+    /// </div>
     ///
     /// See [the book](https://rust-driver.docs.scylladb.com/stable/statements/prepared.html) for more information.
     /// See the documentation of [`PreparedStatement`].
@@ -1191,13 +1505,16 @@ impl Session {
     /// # async fn check_only_compiles(session: &Session) -> Result<(), Box<dyn Error>> {
     /// use scylla::statement::prepared::PreparedStatement;
     ///
-    /// // Prepare the statement for later execution
+    /// // Prepare the statement ONCE for later execution
     /// let prepared: PreparedStatement = session
     ///     .prepare("INSERT INTO ks.tab (a) VALUES(?)")
     ///     .await?;
     ///
-    /// // Execute the prepared statement with some values, just like an unprepared statement.
+    /// // Execute the prepared statement multiple times
     /// let to_insert: i32 = 12345;
+    /// session.execute_unpaged(&prepared, (to_insert,)).await?;
+    ///
+    /// let to_insert: i32 = 67890;
     /// session.execute_unpaged(&prepared, (to_insert,)).await?;
     /// # Ok(())
     /// # }
@@ -1319,38 +1636,6 @@ impl Session {
             .as_deref()
     }
 
-    async fn do_execute_unpaged(
-        &self,
-        prepared: &PreparedStatement,
-        values: impl SerializeRow,
-    ) -> Result<QueryResult, ExecutionError> {
-        let serialized_values = prepared.serialize_values(&values)?;
-        let (result, paging_state) = self
-            .execute(prepared, &serialized_values, None, PagingState::start())
-            .await?;
-        if !paging_state.finished() {
-            error!(
-                "Unpaged prepared query returned a non-empty paging state! This is a driver-side or server-side bug."
-            );
-            return Err(ExecutionError::LastAttemptError(
-                RequestAttemptError::NonfinishedPagingState,
-            ));
-        }
-        Ok(result)
-    }
-
-    async fn do_execute_single_page(
-        &self,
-        prepared: &PreparedStatement,
-        values: impl SerializeRow,
-        paging_state: PagingState,
-    ) -> Result<(QueryResult, PagingStateResponse), ExecutionError> {
-        let serialized_values = prepared.serialize_values(&values)?;
-        let page_size = prepared.get_validated_page_size();
-        self.execute(prepared, &serialized_values, Some(page_size), paging_state)
-            .await
-    }
-
     /// Sends a prepared request to the database, optionally continuing from a saved point.
     ///
     /// This is now an internal method only.
@@ -1405,12 +1690,12 @@ impl Session {
             serialized_values.buffer_size(),
         );
 
-        if !span.span().is_disabled() {
-            if let (Some(table_spec), Some(token)) = (statement_info.table, token) {
-                let cluster_state = self.get_cluster_state();
-                let replicas = cluster_state.get_token_endpoints_iter(table_spec, token);
-                span.record_replicas(replicas)
-            }
+        if !span.span().is_disabled()
+            && let (Some(table_spec), Some(token)) = (statement_info.table, token)
+        {
+            let cluster_state = self.get_cluster_state();
+            let replicas = cluster_state.get_token_endpoints_iter(table_spec, token);
+            span.record_replicas(replicas)
         }
 
         let (run_request_result, coordinator): (
@@ -1465,129 +1750,47 @@ impl Session {
         Ok((result, paging_state_response))
     }
 
-    async fn do_execute_iter(
+    /// Does the same as [`Session::execute_iter`], but without generics.
+    /// This is to reduce code bloat.
+    ///
+    /// Additionally, this function accepts only `SerializedValues`,
+    /// so the caller is responsible for serializing the values beforehand.
+    /// This:
+    /// - on one hand introduces a risk of misusing the API (passing values
+    ///   that don't match the prepared statement) - therefore this API
+    ///   must not be leaked to end users;
+    /// - on the other hand allows manual preserialization of values, which
+    ///   we need in wrapper drivers (e.g. C#-RS Driver) - for them we expose
+    ///   a dedicated API endpoint using this function, conditionally compiled
+    ///   if special compile flag is passed.
+    async fn execute_iter_nongeneric(
         &self,
         prepared: PreparedStatement,
-        values: impl SerializeRow,
+        values: SerializedValues,
     ) -> Result<QueryPager, PagerExecutionError> {
-        let serialized_values = prepared.serialize_values(&values)?;
-
         let execution_profile = prepared
             .get_execution_profile_handle()
             .unwrap_or_else(|| self.get_default_execution_profile_handle())
             .access();
 
-        QueryPager::new_for_prepared_statement(PreparedPagerConfig {
-            prepared,
-            values: serialized_values,
-            execution_profile,
-            cluster_state: self.cluster.get_state(),
-            #[cfg(feature = "metrics")]
-            metrics: Arc::clone(&self.metrics),
-        })
-        .await
-        .map_err(PagerExecutionError::NextPageError)
-    }
-
-    async fn do_batch(
-        &self,
-        batch: &Batch,
-        values: impl BatchValues,
-    ) -> Result<QueryResult, ExecutionError> {
-        // Shard-awareness behavior for batch will be to pick shard based on first batch statement's shard
-        // If users batch statements by shard, they will be rewarded with full shard awareness
-
-        // check to ensure that we don't send a batch statement with more than u16::MAX queries
-        let batch_statements_length = batch.statements.len();
-        if batch_statements_length > u16::MAX as usize {
-            return Err(ExecutionError::BadQuery(
-                BadQuery::TooManyQueriesInBatchStatement(batch_statements_length),
-            ));
-        }
-
-        let execution_profile = batch
-            .get_execution_profile_handle()
-            .unwrap_or_else(|| self.get_default_execution_profile_handle())
-            .access();
-
-        let consistency = batch
-            .config
-            .consistency
-            .unwrap_or(execution_profile.consistency);
-
-        let serial_consistency = batch
-            .config
-            .serial_consistency
-            .unwrap_or(execution_profile.serial_consistency);
-
-        let (first_value_token, values) =
-            batch_values::peek_first_token(values, batch.statements.first())?;
-        let values_ref = &values;
-
-        let table_spec =
-            if let Some(BatchStatement::PreparedStatement(ps)) = batch.statements.first() {
-                ps.get_table_spec()
-            } else {
-                None
-            };
-
-        let statement_info = RoutingInfo {
-            consistency,
-            serial_consistency,
-            token: first_value_token,
-            table: table_spec,
-            is_confirmed_lwt: false,
-        };
-
-        let span = RequestSpan::new_batch();
-
-        let (run_request_result, coordinator): (
-            RunRequestResult<NonErrorQueryResponse>,
-            Coordinator,
-        ) = self
-            .run_request(
-                statement_info,
-                &batch.config,
+        QueryPager::new_for_prepared_statement(
+            self,
+            PreparedPagerConfig {
+                prepared,
+                values,
                 execution_profile,
-                |connection: Arc<Connection>,
-                 consistency: Consistency,
-                 execution_profile: &ExecutionProfileInner| {
-                    let serial_consistency = batch
-                        .config
-                        .serial_consistency
-                        .unwrap_or(execution_profile.serial_consistency);
-                    async move {
-                        connection
-                            .batch_with_consistency(
-                                batch,
-                                values_ref,
-                                consistency,
-                                serial_consistency,
-                            )
-                            .await
-                            .and_then(QueryResponse::into_non_error_query_response)
-                    }
-                },
-                &span,
-            )
-            .instrument(span.span().clone())
-            .await?;
-
-        let result = match run_request_result {
-            RunRequestResult::IgnoredWriteError => QueryResult::mock_empty(coordinator),
-            RunRequestResult::Completed(non_error_query_response) => {
-                let result = non_error_query_response.into_query_result(coordinator)?;
-                span.record_result_fields(&result);
-                result
-            }
-        };
-
-        Ok(result)
+                cluster_state: self.cluster.get_state(),
+                #[cfg(feature = "metrics")]
+                metrics: Arc::clone(&self.metrics),
+            },
+        )
+        .await
     }
 
     /// Prepares all statements within the batch and returns a new batch where every
     /// statement is prepared.
-    /// /// # Example
+    ///
+    /// # Example
     /// ```rust
     /// # extern crate scylla;
     /// # use scylla::client::session::Session;
@@ -1683,9 +1886,7 @@ impl Session {
         // To avoid any possible CQL injections it's good to verify that the name is valid
         let verified_ks_name = VerifiedKeyspaceName::new(keyspace_name, case_sensitive)?;
 
-        self.cluster.use_keyspace(verified_ks_name).await?;
-
-        Ok(())
+        self.cluster.use_keyspace(verified_ks_name).await
     }
 
     /// Manually trigger a metadata refresh\
@@ -1694,7 +1895,10 @@ impl Session {
     /// Normally this is not needed,
     /// the driver should automatically detect all metadata changes in the cluster
     pub async fn refresh_metadata(&self) -> Result<(), MetadataError> {
-        self.cluster.refresh_metadata().await
+        debug!("Session: requested metadata refresh");
+        let res = self.cluster.refresh_metadata().await;
+        debug!("Session: finished metadata refresh");
+        res
     }
 
     /// Access metrics collected by the driver\
@@ -1720,9 +1924,8 @@ impl Session {
     pub async fn get_tracing_info(&self, tracing_id: &Uuid) -> Result<TracingInfo, TracingError> {
         // tracing_info_fetch_attempts is NonZeroU32 so at least one attempt will be made
         for _ in 0..self.tracing_info_fetch_attempts.get() {
-            let current_try: Option<TracingInfo> = self
-                .try_getting_tracing_info(tracing_id, Some(self.tracing_info_fetch_consistency))
-                .await?;
+            let current_try: Option<TracingInfo> =
+                self.try_getting_tracing_info(tracing_id).await?;
 
             match current_try {
                 Some(tracing_info) => return Ok(tracing_info),
@@ -1754,23 +1957,16 @@ impl Session {
     async fn try_getting_tracing_info(
         &self,
         tracing_id: &Uuid,
-        consistency: Option<Consistency>,
     ) -> Result<Option<TracingInfo>, TracingError> {
-        // Query system_traces.sessions for TracingInfo
-        let mut traces_session_query =
-            Statement::new(crate::observability::tracing::TRACES_SESSION_QUERY_STR);
-        traces_session_query.config.consistency = consistency;
-        traces_session_query.set_page_size(TRACING_QUERY_PAGE_SIZE);
+        // Get statements for tracing queries.
+        // Consistency is set during construction based on session's tracing_info_fetch_consistency.
+        let traces_session_stmt = self.get_tracing_session_statement();
+        let traces_events_stmt = self.get_tracing_events_statement();
 
-        // Query system_traces.events for TracingEvents
-        let mut traces_events_query =
-            Statement::new(crate::observability::tracing::TRACES_EVENTS_QUERY_STR);
-        traces_events_query.config.consistency = consistency;
-        traces_events_query.set_page_size(TRACING_QUERY_PAGE_SIZE);
-
+        // Using non-public do_query_unpaged allows us to avoid cloning.
         let (traces_session_res, traces_events_res) = tokio::try_join!(
-            self.do_query_unpaged(&traces_session_query, (tracing_id,)),
-            self.do_query_unpaged(&traces_events_query, (tracing_id,))
+            self.do_query_unpaged(traces_session_stmt, (tracing_id,)),
+            self.do_query_unpaged(traces_events_stmt, (tracing_id,))
         )?;
 
         // Get tracing info
@@ -2144,6 +2340,92 @@ impl Session {
         self.await_schema_agreement_with_required_node(None).await
     }
 
+    /// Decides if an error should result in await_schema_agreement stopping immediately,
+    /// or if it's fine to try again (after schema agreement interval).
+    /// The errors that should stop immediately are non-transient ones, for which
+    /// there is little or no hope that a retry will succeed.
+    fn classify_schema_check_error(error: &SchemaAgreementError) -> ControlFlow<()> {
+        let classify_attempt_error = |request_attempt_error: &RequestAttemptError| {
+            #[deny(clippy::wildcard_enum_match_arm)]
+            match request_attempt_error {
+                // It may be possible to recover from those errors.
+                RequestAttemptError::UnableToAllocStreamId
+                | RequestAttemptError::BrokenConnectionError(_)
+                | RequestAttemptError::BodyExtensionsParseError(_)
+                | RequestAttemptError::CqlResultParseError(_)
+                | RequestAttemptError::CqlErrorParseError(_) => ControlFlow::Continue(()),
+
+                // Those errors should not happen, but if they did, something is
+                // really wrong. Let's return early.
+                RequestAttemptError::SerializationError(_)
+                | RequestAttemptError::CqlRequestSerialization(_)
+                | RequestAttemptError::UnexpectedResponse(_)
+                | RequestAttemptError::RepreparedIdChanged { .. }
+                | RequestAttemptError::RepreparedIdMissingInBatch
+                | RequestAttemptError::NonfinishedPagingState => ControlFlow::Break(()),
+
+                #[deny(clippy::wildcard_enum_match_arm)]
+                RequestAttemptError::DbError(db_error, _) => match db_error {
+                    // Those errors should not happen, but if they did, something is
+                    // really wrong. Let's return early.
+                    DbError::SyntaxError
+                    | DbError::Invalid
+                    | DbError::AlreadyExists { .. }
+                    | DbError::FunctionFailure { .. }
+                    | DbError::AuthenticationError
+                    | DbError::Unauthorized
+                    | DbError::ConfigError
+                    | DbError::TruncateError
+                    | DbError::ProtocolError => ControlFlow::Break(()),
+
+                    // Those errors likely won't go away on retry
+                    DbError::Unavailable { .. }
+                    | DbError::ReadFailure { .. }
+                    | DbError::WriteFailure { .. }
+                    | DbError::ServerError
+                    | DbError::Other(_) => ControlFlow::Break(()),
+
+                    DbError::Overloaded
+                    | DbError::ReadTimeout { .. }
+                    | DbError::WriteTimeout { .. }
+                    | DbError::Unprepared { .. }
+                    | DbError::RateLimitReached { .. }
+                    | DbError::IsBootstrapping
+                    | _ => ControlFlow::Continue(()),
+                },
+            }
+        };
+        #[deny(clippy::wildcard_enum_match_arm)]
+        match error {
+            // Unexpected format (type, row count, frame type etc) or deserialization error of response.
+            // It should not happen, but if it did it indicates a serious issue.
+            SchemaAgreementError::SingleRowError(_)
+            | SchemaAgreementError::TracesEventsIntoRowsResultError(_) => ControlFlow::Break(()),
+
+            // Should not be possible - we create this error only after returning here.
+            // Let's not panic, but log a warning so that it gets noticed.
+            SchemaAgreementError::Timeout(_) => {
+                error!("Unexpected schema agreement error type: {}", error);
+                ControlFlow::Break(())
+            }
+
+            // Definitely a transient error.
+            SchemaAgreementError::ConnectionPoolError(_)
+            | SchemaAgreementError::RequiredHostAbsent(_) => ControlFlow::Continue(()),
+
+            SchemaAgreementError::RequestError(request_attempt_error) => {
+                classify_attempt_error(request_attempt_error)
+            }
+            SchemaAgreementError::PrepareError(err) => match err {
+                PrepareError::ConnectionPoolError(_) => ControlFlow::Continue(()),
+                PrepareError::AllAttemptsFailed { first_attempt } => {
+                    classify_attempt_error(first_attempt)
+                }
+                PrepareError::PreparedStatementIdsMismatch => ControlFlow::Break(()),
+            },
+        }
+    }
+
     /// Awaits schema agreement among all reachable nodes.
     ///
     /// Issues an agreement check each `Session::schema_agreement_interval`.
@@ -2152,7 +2434,7 @@ impl Session {
     ///
     /// If `required_node` is Some, only returns Ok if this node successfully
     /// returned its schema version during the agreement process.
-    async fn await_schema_agreement_with_required_node(
+    pub(crate) async fn await_schema_agreement_with_required_node(
         &self,
         required_node: Option<Uuid>,
     ) -> Result<Uuid, SchemaAgreementError> {
@@ -2160,30 +2442,51 @@ impl Session {
         // Some(Ok(())): Last attempt successful, without agreement
         // Some(Err(_)): Last attempt failed
         let mut last_agreement_failure: Option<Result<(), SchemaAgreementError>> = None;
-        timeout(self.schema_agreement_timeout, async {
+        // The future passed to timeout returns either Ok(Uuid) if agreement was
+        // reached, or Err(SchemaAgreementError) if there was an error that should
+        // stop the waiting before timeout.
+        let agreement_result = timeout(self.schema_agreement_timeout, async {
             loop {
                 let result = self
                     .check_schema_agreement_with_required_node(required_node)
                     .await;
+                debug!("Schema agreement check result: {:?}", result);
                 match result {
-                    Ok(Some(agreed_version)) => return agreed_version,
+                    Ok(Some(agreed_version)) => return Ok(agreed_version),
                     Ok(None) => last_agreement_failure = Some(Ok(())),
-                    Err(err) => last_agreement_failure = Some(Err(err)),
+                    Err(err) => {
+                        let decision = Self::classify_schema_check_error(&err);
+                        match decision {
+                            ControlFlow::Continue(_) => {
+                                last_agreement_failure = Some(Err(err));
+                            }
+                            ControlFlow::Break(_) => return Err(err),
+                        }
+                    }
                 }
                 tokio::time::sleep(self.schema_agreement_interval).await;
             }
         })
-        .await
-        .map_err(|_| {
-            match last_agreement_failure {
-                // There were no finished attempts - the only error we can return is Timeout.
-                None => SchemaAgreementError::Timeout(self.schema_agreement_timeout),
-                // If the last finished attempt resulted in an error, this error will be more informative than Timeout.
-                Some(Err(err)) => err,
-                // This is the canonical case for timeout - last attempt finished successfully, but without agreement.
-                Some(Ok(())) => SchemaAgreementError::Timeout(self.schema_agreement_timeout),
+        .await;
+        match agreement_result {
+            Err(_timeout) => {
+                // Timeout occurred. Either all attempts returned possibly-transient errors,
+                // or just did not reach agreement in time.
+                let effective_error = match last_agreement_failure {
+                    // There were no finished attempts - the only error we can return is Timeout.
+                    None => SchemaAgreementError::Timeout(self.schema_agreement_timeout),
+                    // If the last finished attempt resulted in an error, this error will be more informative than Timeout.
+                    Some(Err(err)) => err,
+                    // This is the canonical case for timeout - last attempt finished successfully, but without agreement.
+                    Some(Ok(())) => SchemaAgreementError::Timeout(self.schema_agreement_timeout),
+                };
+                Err(effective_error)
             }
-        })
+            // Agreement encountered a non-transient error, we must return it.
+            Ok(Err(inner_error)) => Err(inner_error),
+            // Agreement successful
+            Ok(Ok(uuid)) => Ok(uuid),
+        }
     }
 
     /// Checks if all reachable nodes have the same schema version.
@@ -2208,7 +2511,7 @@ impl Session {
 
         // Therefore, this iterator is guaranteed to be nonempty, too.
         let handles = per_node_connections.map(|(host_id, pool)| async move {
-            (host_id, Session::read_node_schema_version(pool).await)
+            (host_id, self.read_node_schema_version(pool).await)
         });
         // Hence, this is nonempty, too.
         let versions_results = join_all(handles).await;
@@ -2234,6 +2537,8 @@ impl Session {
 
         // Now we no longer need all the errors. We can return if there is
         // irrecoverable one, and collect the Ok values otherwise.
+        // TODO(2.0): This expect can be avoided in next major release
+        #[expect(clippy::result_large_err)]
         let versions_results: Vec<_> = versions_results
             .into_iter()
             .map(|(_, result)| result)
@@ -2275,12 +2580,13 @@ impl Session {
     ///
     /// `connections_to_node` iterator must be non-empty!
     async fn read_node_schema_version(
+        &self,
         connections_to_node: impl Iterator<Item = Arc<Connection>>,
     ) -> Result<SchemaNodeResult, SchemaAgreementError> {
         let mut first_broken_connection_err: Option<BrokenConnectionError> = None;
         let mut first_unignorable_err: Option<SchemaAgreementError> = None;
         for connection in connections_to_node {
-            match connection.fetch_schema_version().await {
+            match self.fetch_connection_schema_version(&connection).await {
                 Ok(schema_version) => return Ok(SchemaNodeResult::Success(schema_version)),
                 Err(SchemaAgreementError::RequestError(
                     RequestAttemptError::BrokenConnectionError(conn_err),
@@ -2305,6 +2611,24 @@ impl Session {
         Ok(SchemaNodeResult::BrokenConnection(
             first_broken_connection_err.unwrap(),
         ))
+    }
+
+    /// Fetches the schema version from a single connection.
+    async fn fetch_connection_schema_version(
+        &self,
+        connection: &Connection,
+    ) -> Result<Uuid, SchemaAgreementError> {
+        let result = connection
+            .query_unpaged(self.get_schema_version_statement())
+            .await?;
+
+        let (version_id,) = result
+            .into_rows_result()
+            .map_err(SchemaAgreementError::TracesEventsIntoRowsResultError)?
+            .single_row::<(Uuid,)>()
+            .map_err(SchemaAgreementError::SingleRowError)?;
+
+        Ok(version_id)
     }
 
     /// Retrieves the handle to execution profile that is used by this session

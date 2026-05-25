@@ -239,11 +239,22 @@ async fn test_raw_use_keyspace() {
             .is_ok()
     );
 
+    // Test pager APIs
+    {
+        let _pager = session.query_iter("use    system    ;", &[]).await.unwrap();
+        session
+            .query_unpaged("SELECT host_id FROM local WHERE key = 'local'", ())
+            .await
+            .expect("Keyspace seen to not have been correctly set by Pager execution");
+    }
+
     session.ddl(format!("DROP KEYSPACE {ks}")).await.unwrap();
 }
 
 #[tokio::test]
 async fn test_get_keyspace_name() {
+    setup_tracing();
+
     let ks = unique_keyspace_name();
 
     // Create the keyspace

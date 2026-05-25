@@ -10,9 +10,10 @@ use crate::serialize::writers::WrittenCellProof;
 use crate::serialize::{CellWriter, SerializationError};
 use crate::value::{
     Counter, CqlDate, CqlDuration, CqlTime, CqlTimestamp, CqlTimeuuid, CqlValue, CqlVarint,
-    MaybeUnset, Unset,
+    Emptiable, MaybeEmpty, MaybeUnset, Unset,
 };
 
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -25,7 +26,7 @@ use bytes::Bytes;
 use thiserror::Error;
 use uuid::Uuid;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
 struct SerializeWithCustomError;
 
 #[derive(Error, Debug)]
@@ -42,8 +43,15 @@ impl SerializeValue for SerializeWithCustomError {
     }
 }
 
-#[cfg(feature = "secrecy-08")]
-impl secrecy_08::Zeroize for SerializeWithCustomError {
+// When both secrecy features are enabled, prefer secrecy-10's zeroize.
+// They both refer to the same trait.
+#[cfg(feature = "secrecy-10")]
+impl secrecy_10::zeroize::Zeroize for SerializeWithCustomError {
+    fn zeroize(&mut self) {}
+}
+
+#[cfg(all(feature = "secrecy-08", not(feature = "secrecy-10")))]
+impl secrecy_08::zeroize::Zeroize for SerializeWithCustomError {
     fn zeroize(&mut self) {}
 }
 
@@ -100,11 +108,11 @@ fn test_native_errors() {
     // Simple type mismatch
     let v = 123_i32;
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Double));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<i32>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Double));
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<i32>());
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Double));
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[ColumnType::Native(NativeType::Int)],
         }
@@ -114,11 +122,11 @@ fn test_native_errors() {
     // also check str here
     let v = "Ala ma kota";
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Double));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<&str>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Double));
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<&str>());
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Double));
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[
                 ColumnType::Native(NativeType::Ascii),
@@ -137,11 +145,11 @@ fn test_native_errors() {
 /// `Option<i32>` instead of `i32`).
 fn verify_typeck_error_in_wrapper<T: SerializeValue>(v: T) {
     let err = do_serialize_err::<T>(v, &ColumnType::Native(NativeType::Text));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<T>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Text));
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<T>());
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Text));
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[ColumnType::Native(NativeType::Int)]
         }
@@ -162,6 +170,16 @@ fn test_secrecy_08_errors() {
     verify_typeck_error_in_wrapper::<Secret<i32>>(Secret::new(123));
     verify_custom_error_in_wrapper::<Secret<SerializeWithCustomError>>(Secret::new(
         SerializeWithCustomError,
+    ));
+}
+
+#[cfg(feature = "secrecy-10")]
+#[test]
+fn test_secrecy_10_errors() {
+    use secrecy_10::SecretBox;
+    verify_typeck_error_in_wrapper::<SecretBox<i32>>(SecretBox::new(Box::new(123)));
+    verify_custom_error_in_wrapper::<SecretBox<SerializeWithCustomError>>(SecretBox::new(
+        Box::new(SerializeWithCustomError),
     ));
 }
 
@@ -203,6 +221,14 @@ fn test_arc_errors() {
     ));
 }
 
+#[test]
+fn test_cow_errors() {
+    verify_typeck_error_in_wrapper::<Cow<i32>>(Cow::Borrowed(&123));
+    verify_custom_error_in_wrapper::<Cow<SerializeWithCustomError>>(Cow::Borrowed(
+        &SerializeWithCustomError,
+    ));
+}
+
 #[cfg(feature = "bigdecimal-04")]
 #[test]
 fn test_native_errors_bigdecimal_04() {
@@ -212,10 +238,10 @@ fn test_native_errors_bigdecimal_04() {
     // Value overflow (type out of representable range)
     let v = BigDecimal::new(BigInt::from(123), 1i64 << 40);
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Decimal));
-    let err = get_ser_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<BigDecimal>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Decimal));
-    assert_matches!(err.kind, BuiltinSerializationErrorKind::ValueOverflow);
+    let ser_err = get_ser_err(&err);
+    assert_eq!(ser_err.rust_name, std::any::type_name::<BigDecimal>());
+    assert_eq!(ser_err.got, ColumnType::Native(NativeType::Decimal));
+    assert_matches!(ser_err.kind, BuiltinSerializationErrorKind::ValueOverflow);
 }
 
 #[test]
@@ -223,11 +249,11 @@ fn test_set_or_list_errors() {
     // Not a set or list
     let v = vec![123_i32];
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Double));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<Vec<i32>>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Double));
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<Vec<i32>>());
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Double));
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::SetOrListError(SetOrListTypeCheckErrorKind::NotSetOrList)
     );
 
@@ -241,11 +267,11 @@ fn test_set_or_list_errors() {
         typ: CollectionType::List(Box::new(ColumnType::Native(NativeType::Int))),
     };
     let err = do_serialize_err(v, &typ);
-    let err = get_ser_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<&[Unset]>());
-    assert_eq!(err.got, typ);
+    let ser_err = get_ser_err(&err);
+    assert_eq!(ser_err.rust_name, std::any::type_name::<&[Unset]>());
+    assert_eq!(ser_err.got, typ);
     assert_matches!(
-        err.kind,
+        ser_err.kind,
         BuiltinSerializationErrorKind::SetOrListError(
             SetOrListSerializationErrorKind::TooManyElements
         )
@@ -258,18 +284,18 @@ fn test_set_or_list_errors() {
         typ: CollectionType::List(Box::new(ColumnType::Native(NativeType::Double))),
     };
     let err = do_serialize_err(v, &typ);
-    let err = get_ser_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<Vec<i32>>());
-    assert_eq!(err.got, typ);
+    let ser_err = get_ser_err(&err);
+    assert_eq!(ser_err.rust_name, std::any::type_name::<Vec<i32>>());
+    assert_eq!(ser_err.got, typ);
     let BuiltinSerializationErrorKind::SetOrListError(
         SetOrListSerializationErrorKind::ElementSerializationFailed(err),
-    ) = &err.kind
+    ) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
-    let err = get_typeck_err(err);
+    let typeck_err = get_typeck_err(err);
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[ColumnType::Native(NativeType::Int)],
         }
@@ -283,12 +309,12 @@ fn test_set_or_list_errors() {
             typ: CollectionType::Set(Box::new(ColumnType::Native(NativeType::Double))),
         },
     );
-    let err = get_ser_err(&err);
+    let ser_err = get_ser_err(&err);
     let BuiltinSerializationErrorKind::SetOrListError(
         SetOrListSerializationErrorKind::ElementSerializationFailed(err),
-    ) = &err.kind
+    ) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
     err.0
         .downcast_ref::<CustomSerializationError>()
@@ -300,11 +326,14 @@ fn test_map_errors() {
     // Not a map
     let v = BTreeMap::from([("foo", "bar")]);
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Double));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<BTreeMap<&str, &str>>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Double));
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(
+        typeck_err.rust_name,
+        std::any::type_name::<BTreeMap<&str, &str>>()
+    );
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Double));
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MapError(MapTypeCheckErrorKind::NotMap)
     );
 
@@ -321,18 +350,21 @@ fn test_map_errors() {
         ),
     };
     let err = do_serialize_err(v, &typ);
-    let err = get_ser_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<BTreeMap<i32, i32>>());
-    assert_eq!(err.got, typ);
+    let ser_err = get_ser_err(&err);
+    assert_eq!(
+        ser_err.rust_name,
+        std::any::type_name::<BTreeMap<i32, i32>>()
+    );
+    assert_eq!(ser_err.got, typ);
     let BuiltinSerializationErrorKind::MapError(MapSerializationErrorKind::KeySerializationFailed(
         err,
-    )) = &err.kind
+    )) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
-    let err = get_typeck_err(err);
+    let typeck_err = get_typeck_err(err);
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[ColumnType::Native(NativeType::Int)],
         }
@@ -348,18 +380,21 @@ fn test_map_errors() {
         ),
     };
     let err = do_serialize_err(v, &typ);
-    let err = get_ser_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<BTreeMap<i32, i32>>());
-    assert_eq!(err.got, typ);
+    let ser_err = get_ser_err(&err);
+    assert_eq!(
+        ser_err.rust_name,
+        std::any::type_name::<BTreeMap<i32, i32>>()
+    );
+    assert_eq!(ser_err.got, typ);
     let BuiltinSerializationErrorKind::MapError(
         MapSerializationErrorKind::ValueSerializationFailed(err),
-    ) = &err.kind
+    ) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
-    let err = get_typeck_err(err);
+    let typeck_err = get_typeck_err(err);
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[ColumnType::Native(NativeType::Int)],
         }
@@ -377,12 +412,12 @@ fn test_map_errors() {
             ),
         },
     );
-    let err = get_ser_err(&err);
+    let ser_err = get_ser_err(&err);
     let BuiltinSerializationErrorKind::MapError(
         MapSerializationErrorKind::ValueSerializationFailed(err),
-    ) = &err.kind
+    ) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
     err.0
         .downcast_ref::<CustomSerializationError>()
@@ -399,12 +434,12 @@ fn test_map_errors() {
             ),
         },
     );
-    let err = get_ser_err(&err);
+    let ser_err = get_ser_err(&err);
     let BuiltinSerializationErrorKind::MapError(MapSerializationErrorKind::KeySerializationFailed(
         err,
-    )) = &err.kind
+    )) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
     err.0
         .downcast_ref::<CustomSerializationError>()
@@ -416,11 +451,14 @@ fn test_tuple_errors() {
     // Not a tuple
     let v = (123_i32, 456_i32, 789_i32);
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Double));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<(i32, i32, i32)>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Double));
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(
+        typeck_err.rust_name,
+        std::any::type_name::<(i32, i32, i32)>()
+    );
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Double));
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::TupleError(TupleTypeCheckErrorKind::NotTuple)
     );
 
@@ -428,11 +466,14 @@ fn test_tuple_errors() {
     let v = (123_i32, 456_i32, 789_i32);
     let typ = ColumnType::Tuple(vec![ColumnType::Native(NativeType::Int); 2]);
     let err = do_serialize_err(v, &typ);
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<(i32, i32, i32)>());
-    assert_eq!(err.got, typ);
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(
+        typeck_err.rust_name,
+        std::any::type_name::<(i32, i32, i32)>()
+    );
+    assert_eq!(typeck_err.got, typ);
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::TupleError(TupleTypeCheckErrorKind::WrongElementCount {
             rust_type_el_count: 3,
             cql_type_el_count: 2,
@@ -447,18 +488,18 @@ fn test_tuple_errors() {
         ColumnType::Native(NativeType::Uuid),
     ]);
     let err = do_serialize_err(v, &typ);
-    let err = get_ser_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<(i32, &str, f64)>());
-    assert_eq!(err.got, typ);
+    let ser_err = get_ser_err(&err);
+    assert_eq!(ser_err.rust_name, std::any::type_name::<(i32, &str, f64)>());
+    assert_eq!(ser_err.got, typ);
     let BuiltinSerializationErrorKind::TupleError(
         TupleSerializationErrorKind::ElementSerializationFailed { index: 2, err },
-    ) = &err.kind
+    ) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
-    let err = get_typeck_err(err);
+    let typeck_err = get_typeck_err(err);
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[ColumnType::Native(NativeType::Double)],
         }
@@ -472,12 +513,12 @@ fn test_tuple_errors() {
             ColumnType::Native(NativeType::Double),
         ]),
     );
-    let err = get_ser_err(&err);
+    let ser_err = get_ser_err(&err);
     let BuiltinSerializationErrorKind::TupleError(
         TupleSerializationErrorKind::ElementSerializationFailed { index: 0, err },
-    ) = &err.kind
+    ) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
     err.0
         .downcast_ref::<CustomSerializationError>()
@@ -489,10 +530,10 @@ fn test_cql_value_errors() {
     // Tried to encode Empty value into a non-emptyable type
     let v = CqlValue::Empty;
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Counter));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<CqlValue>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Counter));
-    assert_matches!(err.kind, BuiltinTypeCheckErrorKind::NotEmptyable);
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<CqlValue>());
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Counter));
+    assert_matches!(typeck_err.kind, BuiltinTypeCheckErrorKind::NotEmptyable);
 
     // Handle tuples and UDTs in separate tests, as they have some
     // custom logic
@@ -507,11 +548,11 @@ fn test_cql_value_tuple_errors() {
         Some(CqlValue::Int(789_i32)),
     ]);
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Double));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<CqlValue>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Double));
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<CqlValue>());
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Double));
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::TupleError(TupleTypeCheckErrorKind::NotTuple)
     );
 
@@ -523,11 +564,11 @@ fn test_cql_value_tuple_errors() {
     ]);
     let typ = ColumnType::Tuple(vec![ColumnType::Native(NativeType::Int); 2]);
     let err = do_serialize_err(v, &typ);
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<CqlValue>());
-    assert_eq!(err.got, typ);
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<CqlValue>());
+    assert_eq!(typeck_err.got, typ);
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::TupleError(TupleTypeCheckErrorKind::WrongElementCount {
             rust_type_el_count: 3,
             cql_type_el_count: 2,
@@ -546,18 +587,18 @@ fn test_cql_value_tuple_errors() {
         ColumnType::Native(NativeType::Uuid),
     ]);
     let err = do_serialize_err(v, &typ);
-    let err = get_ser_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<CqlValue>());
-    assert_eq!(err.got, typ);
+    let ser_err = get_ser_err(&err);
+    assert_eq!(ser_err.rust_name, std::any::type_name::<CqlValue>());
+    assert_eq!(ser_err.got, typ);
     let BuiltinSerializationErrorKind::TupleError(
         TupleSerializationErrorKind::ElementSerializationFailed { index: 2, err },
-    ) = &err.kind
+    ) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
-    let err = get_typeck_err(err);
+    let typeck_err = get_typeck_err(err);
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[ColumnType::Native(NativeType::Double)],
         }
@@ -577,11 +618,11 @@ fn test_cql_value_udt_errors() {
         ],
     };
     let err = do_serialize_err(v, &ColumnType::Native(NativeType::Double));
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<CqlValue>());
-    assert_eq!(err.got, ColumnType::Native(NativeType::Double));
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<CqlValue>());
+    assert_eq!(typeck_err.got, ColumnType::Native(NativeType::Double));
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::UdtError(UdtTypeCheckErrorKind::NotUdt)
     );
 
@@ -608,15 +649,15 @@ fn test_cql_value_udt_errors() {
         }),
     };
     let err = do_serialize_err(v, &typ);
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<CqlValue>());
-    assert_eq!(err.got, typ);
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<CqlValue>());
+    assert_eq!(typeck_err.got, typ);
     let BuiltinTypeCheckErrorKind::UdtError(UdtTypeCheckErrorKind::NameMismatch {
         keyspace,
         type_name,
-    }) = &err.kind
+    }) = &typeck_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", typeck_err.kind)
     };
     assert_eq!(keyspace, "ks");
     assert_eq!(type_name, "udt2");
@@ -644,13 +685,13 @@ fn test_cql_value_udt_errors() {
         }),
     };
     let err = do_serialize_err(v, &typ);
-    let err = get_typeck_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<CqlValue>());
-    assert_eq!(err.got, typ);
+    let typeck_err = get_typeck_err(&err);
+    assert_eq!(typeck_err.rust_name, std::any::type_name::<CqlValue>());
+    assert_eq!(typeck_err.got, typ);
     let BuiltinTypeCheckErrorKind::UdtError(UdtTypeCheckErrorKind::NoSuchFieldInUdt { field_name }) =
-        &err.kind
+        &typeck_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", typeck_err.kind)
     };
     assert_eq!(field_name, "c");
 
@@ -680,19 +721,19 @@ fn test_cql_value_udt_errors() {
         }),
     };
     let err = do_serialize_err(v, &typ);
-    let err = get_ser_err(&err);
-    assert_eq!(err.rust_name, std::any::type_name::<CqlValue>());
-    assert_eq!(err.got, typ);
+    let ser_err = get_ser_err(&err);
+    assert_eq!(ser_err.rust_name, std::any::type_name::<CqlValue>());
+    assert_eq!(ser_err.got, typ);
     let BuiltinSerializationErrorKind::UdtError(
         UdtSerializationErrorKind::FieldSerializationFailed { field_name, err },
-    ) = &err.kind
+    ) = &ser_err.kind
     else {
-        panic!("unexpected error kind: {}", err.kind)
+        panic!("unexpected error kind: {}", ser_err.kind)
     };
     assert_eq!(field_name, "c");
-    let err = get_typeck_err(err);
+    let typeck_err = get_typeck_err(err);
     assert_matches!(
-        err.kind,
+        typeck_err.kind,
         BuiltinTypeCheckErrorKind::MismatchedType {
             expected: &[ColumnType::Native(NativeType::Int)],
         }
@@ -2241,6 +2282,30 @@ fn box_serialization() {
         do_serialize(x, &ColumnType::Native(NativeType::Int)),
         vec![0, 0, 0, 4, 0, 0, 0, 123]
     );
+
+    let x: Box<str> = "123".to_string().into_boxed_str();
+    assert_eq!(
+        do_serialize(x, &ColumnType::Native(NativeType::Text)),
+        vec![0, 0, 0, 3, 49, 50, 51]
+    );
+
+    let x: Box<[i32]> = vec![1, 2, 3].into_boxed_slice();
+    assert_eq!(
+        do_serialize(
+            x,
+            &ColumnType::Collection {
+                frozen: false,
+                typ: CollectionType::List(Box::new(ColumnType::Native(NativeType::Int)))
+            }
+        ),
+        vec![
+            0, 0, 0, 28, // Length of serialized data
+            0, 0, 0, 3, // Element count
+            0, 0, 0, 4, 0, 0, 0, 1, // 1st element
+            0, 0, 0, 4, 0, 0, 0, 2, // 2nd element
+            0, 0, 0, 4, 0, 0, 0, 3 // 3rd element
+        ]
+    );
 }
 
 #[test]
@@ -2249,6 +2314,39 @@ fn arc_serialization() {
     assert_eq!(
         do_serialize(x, &ColumnType::Native(NativeType::Int)),
         vec![0, 0, 0, 4, 0, 0, 0, 123]
+    );
+
+    let x: Arc<str> = "123".into();
+    assert_eq!(
+        do_serialize(x, &ColumnType::Native(NativeType::Text)),
+        vec![0, 0, 0, 3, 49, 50, 51]
+    );
+
+    let x: Arc<[i32]> = [1, 2, 3].into();
+    assert_eq!(
+        do_serialize(
+            x,
+            &ColumnType::Collection {
+                frozen: false,
+                typ: CollectionType::List(Box::new(ColumnType::Native(NativeType::Int)))
+            }
+        ),
+        vec![
+            0, 0, 0, 28, // Length of serialized data
+            0, 0, 0, 3, // Element count
+            0, 0, 0, 4, 0, 0, 0, 1, // 1st element
+            0, 0, 0, 4, 0, 0, 0, 2, // 2nd element
+            0, 0, 0, 4, 0, 0, 0, 3 // 3rd element
+        ]
+    );
+}
+
+#[test]
+fn cow_serialization() {
+    let x: Cow<str> = "123".into();
+    assert_eq!(
+        do_serialize(x, &ColumnType::Native(NativeType::Text)),
+        vec![0, 0, 0, 3, 49, 50, 51]
     );
 }
 
@@ -2508,11 +2606,53 @@ fn cqlvalue_serialization() {
 
 #[cfg(feature = "secrecy-08")]
 #[test]
-fn secret_serialization() {
+fn secret_08_serialization() {
     let secret = secrecy_08::Secret::new(987654i32);
     assert_eq!(
         do_serialize(secret, &ColumnType::Native(NativeType::Int)),
         vec![0, 0, 0, 4, 0x00, 0x0f, 0x12, 0x06]
+    );
+}
+
+#[cfg(feature = "secrecy-10")]
+#[test]
+fn secret_010_box_serialization() {
+    let secret = secrecy_10::SecretBox::new(Box::new(987654i32));
+    assert_eq!(
+        do_serialize(secret, &ColumnType::Native(NativeType::Int)),
+        vec![0, 0, 0, 4, 0x00, 0x0f, 0x12, 0x06]
+    );
+}
+
+#[cfg(feature = "secrecy-10")]
+#[test]
+fn secret_010_string_serialization() {
+    let secret = secrecy_10::SecretString::from("hello".to_string());
+    assert_eq!(
+        do_serialize(&secret, &ColumnType::Native(NativeType::Text)),
+        vec![0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o']
+    );
+}
+
+#[cfg(feature = "secrecy-10")]
+#[test]
+fn secret_010_slice_serialization() {
+    let secret = secrecy_10::SecretSlice::from(vec![1i32, 2, 3]);
+    assert_eq!(
+        do_serialize(
+            &secret,
+            &ColumnType::Collection {
+                frozen: false,
+                typ: CollectionType::List(Box::new(ColumnType::Native(NativeType::Int)))
+            }
+        ),
+        vec![
+            0, 0, 0, 28, // total size (4 bytes for count + 24 bytes for elements)
+            0, 0, 0, 3, // 3 elements
+            0, 0, 0, 4, 0, 0, 0, 1, // 1_i32 (4 bytes size + 4 bytes value)
+            0, 0, 0, 4, 0, 0, 0, 2, // 2_i32
+            0, 0, 0, 4, 0, 0, 0, 3, // 3_i32
+        ]
     );
 }
 
@@ -2577,4 +2717,126 @@ fn ref_value() {
     }
 
     check(&1_i32, 1_i32, &ColumnType::Native(NativeType::Int));
+}
+
+#[test]
+fn test_maybe_empty_serialization() {
+    // Test MaybeEmpty with various emptiable types
+
+    // MaybeEmpty::Empty serializes to an empty value (0 bytes)
+    let empty_int: MaybeEmpty<i32> = MaybeEmpty::Empty;
+    assert_eq!(
+        do_serialize(empty_int, &ColumnType::Native(NativeType::Int)),
+        vec![0, 0, 0, 0] // length 0
+    );
+
+    // MaybeEmpty::Value serializes the inner value normally
+    let value_int: MaybeEmpty<i32> = MaybeEmpty::Value(123);
+    assert_eq!(
+        do_serialize(value_int, &ColumnType::Native(NativeType::Int)),
+        vec![0, 0, 0, 4, 0, 0, 0, 123]
+    );
+
+    // Test with other emptiable types
+    let empty_i8: MaybeEmpty<i8> = MaybeEmpty::Empty;
+    assert_eq!(
+        do_serialize(empty_i8, &ColumnType::Native(NativeType::TinyInt)),
+        vec![0, 0, 0, 0]
+    );
+
+    let value_i8: MaybeEmpty<i8> = MaybeEmpty::Value(42);
+    assert_eq!(
+        do_serialize(value_i8, &ColumnType::Native(NativeType::TinyInt)),
+        vec![0, 0, 0, 1, 42]
+    );
+
+    // Test with i64
+    let empty_i64: MaybeEmpty<i64> = MaybeEmpty::Empty;
+    assert_eq!(
+        do_serialize(empty_i64, &ColumnType::Native(NativeType::BigInt)),
+        vec![0, 0, 0, 0]
+    );
+
+    let value_i64: MaybeEmpty<i64> = MaybeEmpty::Value(9876543210);
+    assert_eq!(
+        do_serialize(value_i64, &ColumnType::Native(NativeType::BigInt)),
+        vec![0, 0, 0, 8, 0, 0, 0, 2, 76, 176, 22, 234]
+    );
+
+    // Test with bool
+    let empty_bool: MaybeEmpty<bool> = MaybeEmpty::Empty;
+    assert_eq!(
+        do_serialize(empty_bool, &ColumnType::Native(NativeType::Boolean)),
+        vec![0, 0, 0, 0]
+    );
+
+    let value_bool: MaybeEmpty<bool> = MaybeEmpty::Value(true);
+    assert_eq!(
+        do_serialize(value_bool, &ColumnType::Native(NativeType::Boolean)),
+        vec![0, 0, 0, 1, 1]
+    );
+
+    // Test with CqlVarint
+    let empty_varint: MaybeEmpty<CqlVarint> = MaybeEmpty::Empty;
+    assert_eq!(
+        do_serialize(empty_varint, &ColumnType::Native(NativeType::Varint)),
+        vec![0, 0, 0, 0]
+    );
+
+    let value_varint: MaybeEmpty<CqlVarint> =
+        MaybeEmpty::Value(CqlVarint::from_signed_bytes_be(vec![0x7F]));
+    assert_eq!(
+        do_serialize(value_varint, &ColumnType::Native(NativeType::Varint)),
+        vec![0, 0, 0, 1, 0x7F]
+    );
+}
+
+#[test]
+fn test_maybe_empty_errors() {
+    // Test that MaybeEmpty::Empty fails for non-emptiable types (e.g., Counter)
+    let empty_counter: MaybeEmpty<i64> = MaybeEmpty::Empty;
+    let err = do_serialize_err(empty_counter, &ColumnType::Native(NativeType::Counter));
+    let err = get_typeck_err(&err);
+    assert_eq!(err.rust_name, std::any::type_name::<MaybeEmpty<i64>>());
+    assert_eq!(err.got, ColumnType::Native(NativeType::Counter));
+    assert_matches!(err.kind, BuiltinTypeCheckErrorKind::NotEmptyable);
+
+    // Test that MaybeEmpty properly propagates errors from inner value serialization
+    let value_int: MaybeEmpty<i32> = MaybeEmpty::Value(123);
+    let err = do_serialize_err(value_int, &ColumnType::Native(NativeType::Double));
+    let err = get_typeck_err(&err);
+    assert_eq!(err.rust_name, std::any::type_name::<MaybeEmpty<i32>>());
+    assert_eq!(err.got, ColumnType::Native(NativeType::Double));
+    assert_matches!(
+        err.kind,
+        BuiltinTypeCheckErrorKind::MismatchedType {
+            expected: &[ColumnType::Native(NativeType::Int)],
+        }
+    );
+}
+
+#[test]
+fn test_maybe_empty_with_custom_error() {
+    // Custom type that implements Emptiable and SerializeValue with an error
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct CustomEmptiable;
+
+    impl Emptiable for CustomEmptiable {}
+
+    impl SerializeValue for CustomEmptiable {
+        fn serialize<'b>(
+            &self,
+            _typ: &ColumnType,
+            _writer: CellWriter<'b>,
+        ) -> Result<WrittenCellProof<'b>, SerializationError> {
+            Err(SerializationError::new(CustomSerializationError))
+        }
+    }
+
+    // MaybeEmpty::Value should propagate the custom error
+    let value: MaybeEmpty<CustomEmptiable> = MaybeEmpty::Value(CustomEmptiable);
+    let err = do_serialize_err(value, &ColumnType::Native(NativeType::Int));
+    err.0
+        .downcast_ref::<CustomSerializationError>()
+        .expect("CustomSerializationError");
 }

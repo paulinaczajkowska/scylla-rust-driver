@@ -5,7 +5,9 @@ members = [
     "scylla-macros",
     "scylla-cql",
     "scylla-proxy",
-    "utils",
+    "utils/analyze_errors_size",
+    "utils/find_stale_test_keyspaces",
+    "utils/generate_book_tests",
 ]
 resolver = "3"
 

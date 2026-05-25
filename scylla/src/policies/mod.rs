@@ -17,7 +17,15 @@
 
 pub mod address_translator;
 pub mod host_filter;
+#[cfg(all(scylla_unstable, feature = "unstable-host-listener"))]
+pub mod host_listener;
+#[cfg(not(all(scylla_unstable, feature = "unstable-host-listener")))]
+pub(crate) mod host_listener;
 pub mod load_balancing;
+#[cfg(all(scylla_unstable, feature = "unstable-reconnect-policy"))]
+pub mod reconnect;
+#[cfg(not(all(scylla_unstable, feature = "unstable-reconnect-policy")))]
+pub(crate) mod reconnect;
 pub mod retry;
 pub mod speculative_execution;
 pub mod timestamp_generator;

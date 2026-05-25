@@ -14,7 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let uri = std::env::var("SCYLLA_URI")
-        .unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+        .unwrap_or_else(|_| "172.42.0.2:9042".to_string());
 
     let session: Session = SessionBuilder::new()
         .known_node(uri)
@@ -65,5 +65,6 @@ However, you can set the `cluster_metadata_refresh_interval` to a non-negative v
    compression
    authentication
    tls
+   client-routes
 
 ```

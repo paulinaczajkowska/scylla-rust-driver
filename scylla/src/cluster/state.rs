@@ -1,5 +1,5 @@
 use crate::errors::{ClusterStateTokenError, ConnectionPoolError};
-use crate::network::{Connection, PoolConfig, VerifiedKeyspaceName};
+use crate::network::{Connection, ConnectivityChangeEvent, PoolConfig, VerifiedKeyspaceName};
 #[cfg(feature = "metrics")]
 use crate::observability::metrics::Metrics;
 use crate::policies::host_filter::HostFilter;
@@ -13,7 +13,9 @@ use itertools::Itertools;
 use scylla_cql::frame::response::result::TableSpec;
 use scylla_cql::serialize::row::{RowSerializationContext, SerializeRow, SerializedValues};
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -81,15 +83,61 @@ impl ClusterState {
         }
     }
 
+    /// Triggers immediate pool refills for given nodes. This resets exponential
+    /// backoff for those nodes, so they will be retried immediately instead of
+    /// waiting for the next retry timeout.
+    ///
+    /// Suitable, among others, for nodes whose client routes were added or updated.
+    pub(super) fn trigger_pool_refills_for_hosts(&self, host_ids: impl Iterator<Item = Uuid>) {
+        for host_id in host_ids {
+            if let Some(node) = self.known_peers.get(&host_id) {
+                debug!(
+                    host_id = %host_id,
+                    "Triggering immediate pool refill for relevant Node"
+                );
+                node.trigger_pool_refill();
+            }
+        }
+    }
+
+    /// Triggers an immediate pool refill for the node with the given broadcast
+    /// address. Used when a `STATUS_CHANGE UP` event hints that a node is back
+    /// and its pool (likely in exponential backoff) should retry immediately.
+    pub(super) fn trigger_pool_refill_for_addr(&self, addr: SocketAddr) {
+        for node in self.known_peers.values() {
+            if node.address.into_inner() == addr {
+                debug!(
+                    address = %addr,
+                    host_id = %node.host_id,
+                    "STATUS_CHANGE UP: triggering immediate pool refill"
+                );
+                node.trigger_pool_refill();
+                return;
+            }
+        }
+        debug!(
+            address = %addr,
+            "STATUS_CHANGE UP: no known node with this address"
+        );
+    }
+
     /// Creates new ClusterState using information about topology held in `metadata`.
     /// Uses provided `known_peers` hashmap to recycle nodes if possible.
     #[allow(clippy::too_many_arguments)]
+    // This allow(clippy::type_complexity) is here because I can't satisfy borrow checker while
+    // having the closure type be a type alias.
+    #[allow(clippy::type_complexity)]
     pub(crate) async fn new(
         metadata: Metadata,
         pool_config: &PoolConfig,
         known_peers: &HashMap<Uuid, Arc<Node>>,
+        // Takes old and new known_peers maps as arguments.
+        handle_topology_changes: &mut (
+                 dyn FnMut(&HashMap<Uuid, Arc<Node>>, &HashMap<Uuid, Arc<Node>>) + Send + Sync
+             ),
         used_keyspace: &Option<VerifiedKeyspaceName>,
         host_filter: Option<&dyn HostFilter>,
+        connectivity_events_sender: &mpsc::UnboundedSender<ConnectivityChangeEvent>,
         mut tablets: TabletsInfo,
         old_keyspaces: &HashMap<String, Keyspace>,
         #[cfg(feature = "metrics")] metrics: &Arc<Metrics>,
@@ -125,6 +173,7 @@ impl ClusterState {
                     Arc::new(Node::new(
                         peer_endpoint,
                         pool_config,
+                        connectivity_events_sender.clone(),
                         used_keyspace.clone(),
                         is_enabled,
                         #[cfg(feature = "metrics")]
@@ -139,6 +188,8 @@ impl ClusterState {
                 ring.push((token, Arc::clone(&node)));
             }
         }
+
+        handle_topology_changes(known_peers, &new_known_peers);
 
         let keyspaces: HashMap<String, Keyspace> = metadata
             .keyspaces
@@ -158,7 +209,7 @@ impl ClusterState {
                             "Encountered an error while processing metadata\
                             of keyspace \"{ks_name}\": {e}.\
                             No previous version of this keyspace metadata found, so it will not be\
-                            present in ClusterData until next refresh."
+                            present in ClusterState until next refresh."
                         );
                         None
                     }
@@ -166,6 +217,7 @@ impl ClusterState {
             })
             .collect();
 
+        // Tablets maintenance.
         {
             let removed_nodes = {
                 let mut removed_nodes = HashSet::new();
@@ -189,10 +241,10 @@ impl ClusterState {
             let recreated_nodes = {
                 let mut recreated_nodes = HashMap::new();
                 for (old_peer_id, old_peer_node) in known_peers {
-                    if let Some(new_peer_node) = new_known_peers.get(old_peer_id) {
-                        if !Arc::ptr_eq(old_peer_node, new_peer_node) {
-                            recreated_nodes.insert(*old_peer_id, Arc::clone(new_peer_node));
-                        }
+                    if let Some(new_peer_node) = new_known_peers.get(old_peer_id)
+                        && !Arc::ptr_eq(old_peer_node, new_peer_node)
+                    {
+                        recreated_nodes.insert(*old_peer_id, Arc::clone(new_peer_node));
                     }
                 }
 

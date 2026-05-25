@@ -3,6 +3,7 @@
 // Note: When editing above doc-comment edit the corresponding comment on
 // re-export module in scylla crate too.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::hash::BuildHasher;
@@ -18,7 +19,7 @@ use crate::frame::response::result::{CollectionType, ColumnType, NativeType};
 use crate::frame::types::{unsigned_vint_encode, vint_encode};
 use crate::value::{
     Counter, CqlDate, CqlDecimal, CqlDecimalBorrowed, CqlDuration, CqlTime, CqlTimestamp,
-    CqlTimeuuid, CqlValue, CqlVarint, CqlVarintBorrowed, MaybeUnset, Unset,
+    CqlTimeuuid, CqlValue, CqlVarint, CqlVarintBorrowed, Emptiable, MaybeEmpty, MaybeUnset, Unset,
 };
 
 #[cfg(feature = "chrono-04")]
@@ -227,6 +228,19 @@ impl<V: SerializeValue + secrecy_08::Zeroize> SerializeValue for secrecy_08::Sec
         V::serialize(self.expose_secret(), typ, writer).map_err(fix_rust_name_in_err::<Self>)
     }
 }
+#[cfg(feature = "secrecy-10")]
+impl<V: SerializeValue + secrecy_10::zeroize::Zeroize + ?Sized> SerializeValue
+    for secrecy_10::SecretBox<V>
+{
+    fn serialize<'b>(
+        &self,
+        typ: &ColumnType,
+        writer: CellWriter<'b>,
+    ) -> Result<WrittenCellProof<'b>, SerializationError> {
+        use secrecy_10::ExposeSecret;
+        V::serialize(self.expose_secret(), typ, writer).map_err(fix_rust_name_in_err::<Self>)
+    }
+}
 impl SerializeValue for bool {
     impl_serialize_via_writer!(|me, typ, writer| {
         exact_type_check!(typ, Boolean);
@@ -400,6 +414,28 @@ impl<V: SerializeValue> SerializeValue for MaybeUnset<V> {
         }
     }
 }
+impl<T: SerializeValue + Emptiable> SerializeValue for MaybeEmpty<T> {
+    fn serialize<'b>(
+        &self,
+        typ: &ColumnType,
+        writer: CellWriter<'b>,
+    ) -> Result<WrittenCellProof<'b>, SerializationError> {
+        // Check that the type supports empty values
+        if !typ.supports_special_empty_value() {
+            return Err(mk_typck_err::<Self>(
+                typ,
+                BuiltinTypeCheckErrorKind::NotEmptyable,
+            ));
+        }
+
+        match self {
+            MaybeEmpty::Empty => Ok(writer.set_value(&[]).unwrap()),
+            MaybeEmpty::Value(v) => v
+                .serialize(typ, writer)
+                .map_err(fix_rust_name_in_err::<Self>),
+        }
+    }
+}
 impl<T: SerializeValue + ?Sized> SerializeValue for &T {
     fn serialize<'b>(
         &self,
@@ -425,6 +461,15 @@ impl<T: SerializeValue + ?Sized> SerializeValue for Arc<T> {
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
         T::serialize(&**self, typ, writer).map_err(fix_rust_name_in_err::<Self>)
+    }
+}
+impl<T: SerializeValue + ?Sized + ToOwned> SerializeValue for Cow<'_, T> {
+    fn serialize<'b>(
+        &self,
+        typ: &ColumnType,
+        writer: CellWriter<'b>,
+    ) -> Result<WrittenCellProof<'b>, SerializationError> {
+        T::serialize(self.as_ref(), typ, writer).map_err(fix_rust_name_in_err::<Self>)
     }
 }
 impl<V: SerializeValue, S: BuildHasher + Default> SerializeValue for HashSet<V, S> {
@@ -526,7 +571,7 @@ impl<T: SerializeValue> SerializeValue for Vec<T> {
         }
     }
 }
-impl<'a, T: SerializeValue + 'a> SerializeValue for &'a [T] {
+impl<T: SerializeValue> SerializeValue for [T] {
     fn serialize<'b>(
         &self,
         typ: &ColumnType,
@@ -673,21 +718,22 @@ fn fix_rust_name_in_err<RustT>(mut err: SerializationError) -> SerializationErro
             // The `None` case shouldn't happen considering how we are using
             // the function in the code now, but let's provide it here anyway
             // for correctness.
-            if let Some(err) = err.0.downcast_ref::<BuiltinTypeCheckError>() {
-                if err.rust_name != rust_name {
-                    return SerializationError::new(BuiltinTypeCheckError {
-                        rust_name,
-                        ..err.clone()
-                    });
-                }
+            if let Some(err) = err.0.downcast_ref::<BuiltinTypeCheckError>()
+                && err.rust_name != rust_name
+            {
+                return SerializationError::new(BuiltinTypeCheckError {
+                    rust_name,
+                    ..err.clone()
+                });
             }
-            if let Some(err) = err.0.downcast_ref::<BuiltinSerializationError>() {
-                if err.rust_name != rust_name {
-                    return SerializationError::new(BuiltinSerializationError {
-                        rust_name,
-                        ..err.clone()
-                    });
-                }
+
+            if let Some(err) = err.0.downcast_ref::<BuiltinSerializationError>()
+                && err.rust_name != rust_name
+            {
+                return SerializationError::new(BuiltinSerializationError {
+                    rust_name,
+                    ..err.clone()
+                });
             }
         }
     };

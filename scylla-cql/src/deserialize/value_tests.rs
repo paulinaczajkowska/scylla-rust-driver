@@ -104,6 +104,59 @@ fn test_custom_cassandra_type_parser() {
                 ),
             },
         ),
+        // Frozen collection inside vector.
+        (
+            "org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.Int32Type)), 3)",
+            ColumnType::Vector {
+                typ: Box::new(ColumnType::Collection {
+                    frozen: true,
+                    typ: CollectionType::Set(Box::new(ColumnType::Native(NativeType::Int))),
+                }),
+                dimensions: 3,
+            },
+        ),
+        // Frozen collection inside another frozen collection, inside vector.
+        (
+            "org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.Int32Type)))), 3)",
+            ColumnType::Vector {
+                typ: Box::new(ColumnType::Collection {
+                    frozen: true,
+                    typ: CollectionType::Set(Box::new(ColumnType::Collection {
+                        frozen: true,
+                        typ: CollectionType::Set(Box::new(ColumnType::Native(NativeType::Int))),
+                    })),
+                }),
+                dimensions: 3,
+            },
+        ),
+        // Tuple: non-frozen collection, frozen collection, non-frozen collection, frozen collection.
+        // Tests that frozen context is correctly set and unset.
+        (
+            "org.apache.cassandra.db.marshal.TupleType(\
+               org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.Int32Type),\
+               org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.Int32Type)),\
+               org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.Int32Type),\
+               org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.Int32Type)),\
+            )",
+            ColumnType::Tuple(vec![
+                ColumnType::Collection {
+                    frozen: false,
+                    typ: CollectionType::Set(Box::new(ColumnType::Native(NativeType::Int))),
+                },
+                ColumnType::Collection {
+                    frozen: true,
+                    typ: CollectionType::Set(Box::new(ColumnType::Native(NativeType::Int))),
+                },
+                ColumnType::Collection {
+                    frozen: false,
+                    typ: CollectionType::Set(Box::new(ColumnType::Native(NativeType::Int))),
+                },
+                ColumnType::Collection {
+                    frozen: true,
+                    typ: CollectionType::Set(Box::new(ColumnType::Native(NativeType::Int))),
+                },
+            ]),
+        ),
     ];
 
     for (input, expected) in tests {
@@ -1202,6 +1255,16 @@ fn test_arc() {
     }
 }
 
+#[test]
+fn test_cow() {
+    {
+        let text_bytes = make_bytes(b"abcd");
+        let decoded_str: Cow<str> =
+            deserialize::<Cow<str>>(&ColumnType::Native(NativeType::Text), &text_bytes).unwrap();
+        assert_eq!(&*decoded_str, "abcd");
+    }
+}
+
 pub(crate) fn udt_def_with_fields(
     fields: impl IntoIterator<Item = (impl Into<Cow<'static, str>>, ColumnType<'static>)>,
 ) -> ColumnType<'static> {
@@ -1986,6 +2049,41 @@ fn test_secrecy_08_errors() {
     );
 }
 
+#[cfg(feature = "secrecy-10")]
+#[test]
+fn test_secrecy_10_errors() {
+    use secrecy_10::SecretBox;
+
+    use crate::frame::frame_errors::LowLevelDeserializationError;
+    // Type check correctly renames Rust type
+    assert_type_check_error!(
+        &Bytes::new(),
+        SecretBox<String>,
+        ColumnType::Native(NativeType::Int),
+        BuiltinTypeCheckErrorKind::MismatchedType {
+            expected: &[
+                ColumnType::Native(NativeType::Ascii),
+                ColumnType::Native(NativeType::Text)
+            ]
+        }
+    );
+
+    // Deserialize correctly renames Rust type
+    let v = 123_i32;
+    let bytes = serialize(&ColumnType::Native(NativeType::Int), &v);
+    assert_deser_error!(
+        &bytes,
+        SecretBox<Vec<String>>,
+        ColumnType::Collection {
+            frozen: false,
+            typ: CollectionType::List(Box::new(ColumnType::Native(NativeType::Text)))
+        },
+        BuiltinDeserializationErrorKind::RawCqlBytesReadError(
+            LowLevelDeserializationError::IoError(_)
+        )
+    );
+}
+
 #[test]
 fn test_set_or_list_general_type_errors() {
     // Types that are not even collections
@@ -2601,6 +2699,25 @@ fn test_arc_errors() {
         Arc<str>,
         ColumnType::Native(NativeType::Text),
         BuiltinDeserializationErrorKind::InvalidUtf8(_)
+    );
+}
+
+#[test]
+fn test_cow_errors() {
+    let v = 123_i32;
+    let bytes = serialize(&ColumnType::Native(NativeType::Int), &v);
+
+    // Incompatible types render type check error.
+    assert_type_check_error!(
+        &bytes,
+        Cow<str>,
+        ColumnType::Native(NativeType::Int),
+        BuiltinTypeCheckErrorKind::MismatchedType {
+            expected: &[
+                ColumnType::Native(NativeType::Ascii),
+                ColumnType::Native(NativeType::Text)
+            ],
+        }
     );
 }
 
@@ -3981,4 +4098,44 @@ fn test_timeuuid_deserialize() {
             _ => panic!("Timeuuid parsed as wrong CqlValue"),
         }
     }
+}
+
+#[cfg(feature = "secrecy-10")]
+#[test]
+fn test_secret_010_box_deserialization() {
+    use secrecy_10::{ExposeSecret, SecretBox};
+
+    let num: i32 = 42;
+    let serialized = serialize(&ColumnType::Native(Int), &num);
+    let secret: SecretBox<i32> = deserialize(&ColumnType::Native(Int), &serialized).unwrap();
+
+    assert_eq!(*secret.expose_secret(), num);
+}
+
+#[cfg(feature = "secrecy-10")]
+#[test]
+fn test_secret_010_string_deserialization() {
+    use secrecy_10::{ExposeSecret, SecretString};
+
+    let text = "hello secret";
+    let serialized = serialize(&ColumnType::Native(Text), &text);
+    let secret: SecretString = deserialize(&ColumnType::Native(Text), &serialized).unwrap();
+
+    assert_eq!(secret.expose_secret(), text);
+}
+
+#[cfg(feature = "secrecy-10")]
+#[test]
+fn test_secret_010_slice_deserialization() {
+    use secrecy_10::{ExposeSecret, SecretSlice};
+
+    let vec = vec![1i32, 2, 3];
+    let typ = ColumnType::Collection {
+        frozen: false,
+        typ: CollectionType::List(Box::new(ColumnType::Native(Int))),
+    };
+    let serialized = serialize(&typ, &vec);
+    let secret: SecretSlice<i32> = deserialize(&typ, &serialized).unwrap();
+
+    assert_eq!(secret.expose_secret(), &[1i32, 2, 3]);
 }

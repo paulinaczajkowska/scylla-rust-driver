@@ -6,15 +6,13 @@
 
 mod connection;
 
-#[cfg(test)]
 pub(crate) use connection::open_connection;
 
-pub(crate) use connection::{Connection, ConnectionConfig, VerifiedKeyspaceName};
+pub(crate) use connection::{Connection, ConnectionConfig, TcpSocketOptions, VerifiedKeyspaceName};
 
 mod connection_pool;
 
 pub use connection::WriteCoalescingDelay;
 pub use connection_pool::PoolSize;
-pub(crate) use connection_pool::{NodeConnectionPool, PoolConfig};
-
+pub(crate) use connection_pool::{ConnectivityChangeEvent, NodeConnectionPool, PoolConfig};
 pub(crate) mod tls;

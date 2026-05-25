@@ -6,26 +6,40 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use scylla_cql::serialize::row::SerializedValues;
+use dashmap::DashMap;
 
+use crate::client::client_routes::ClientRoutesSubscriber;
 use crate::client::pager::QueryPager;
-use crate::errors::{NextRowError, RequestAttemptError};
+use crate::errors::{NextPageError, NextRowError, RequestAttemptError, RequestError};
 use crate::network::Connection;
+use crate::serialize::row::SerializeRow;
 use crate::statement::Statement;
 use crate::statement::prepared::PreparedStatement;
+
+const METADATA_QUERY_PAGE_SIZE: i32 = 1024;
+
+pub(crate) type ControlConnectionCache = DashMap<String, PreparedStatement>;
 
 /// The single connection used to fetch metadata and receive events from the cluster.
 pub(super) struct ControlConnection {
     conn: Arc<Connection>,
     /// The custom server-side timeout set for requests executed on the control connection.
     overridden_serverside_timeout: Option<Duration>,
+    cache: Arc<ControlConnectionCache>,
+    client_routes_subscriber: Option<Arc<dyn ClientRoutesSubscriber>>,
 }
 
 impl ControlConnection {
-    pub(super) fn new(conn: Arc<Connection>) -> Self {
+    pub(super) fn new(
+        conn: Arc<Connection>,
+        cache: Arc<ControlConnectionCache>,
+        client_routes_subscriber: Option<Arc<dyn ClientRoutesSubscriber>>,
+    ) -> Self {
         Self {
             conn,
             overridden_serverside_timeout: None,
+            cache,
+            client_routes_subscriber,
         }
     }
 
@@ -35,6 +49,10 @@ impl ControlConnection {
             overridden_serverside_timeout: overridden_timeout,
             ..self
         }
+    }
+
+    pub(super) fn client_routes_subscriber(&self) -> Option<&Arc<dyn ClientRoutesSubscriber>> {
+        self.client_routes_subscriber.as_ref()
     }
 
     pub(super) fn get_connect_address(&self) -> SocketAddr {
@@ -49,46 +67,65 @@ impl ControlConnection {
     /// Appends the custom server-side timeout to the statement string, if such custom timeout
     /// is provided and we are connected to ScyllaDB (since custom timeouts is ScyllaDB-only feature).
     fn maybe_append_timeout_override(&self, statement: &mut Statement) {
-        if let Some(timeout) = self.overridden_serverside_timeout {
-            if self.is_to_scylladb() {
-                // SAFETY: io::fmt::Write impl for String is infallible.
-                write!(
-                    statement.contents,
-                    " USING TIMEOUT {}ms",
-                    timeout.as_millis()
-                )
-                .unwrap()
-            }
+        if let Some(timeout) = self.overridden_serverside_timeout
+            && self.is_to_scylladb()
+        {
+            // SAFETY: io::fmt::Write impl for String is infallible.
+            write!(
+                statement.contents,
+                " USING TIMEOUT {}ms",
+                timeout.as_millis()
+            )
+            .unwrap()
         }
+    }
+
+    async fn get_or_prepare_statement(
+        &self,
+        statement_str: &str,
+    ) -> Result<PreparedStatement, RequestAttemptError> {
+        if let Some(statement) = self.cache.get(statement_str) {
+            return Ok(statement.clone());
+        }
+
+        let mut statement = Statement::new(statement_str);
+        self.maybe_append_timeout_override(&mut statement);
+        statement.set_page_size(METADATA_QUERY_PAGE_SIZE);
+        statement.set_is_idempotent(true);
+        let prepared = Arc::clone(&self.conn).prepare(&statement).await?;
+        // Inserting with pre-`maybe_append_timeout_override` key, because
+        // that is the way we will query the map later.
+        self.cache
+            .insert(statement_str.to_string(), prepared.clone());
+        Ok(prepared)
     }
 
     /// Executes a query and fetches its results over multiple pages, using
     /// the asynchronous iterator interface.
+    ///
+    /// NOTE: This function only supports executing SELECT statements.
+    /// More specifically, it expects that each response is of Rows kind.
+    /// Other kinds of responses will result in an error.
     pub(super) async fn query_iter(
         &self,
-        mut statement: Statement,
+        statement: &str,
+        // Without this `Sync` compiler complains that cluster worker future is not Send.
+        values: &(dyn SerializeRow + Sync),
     ) -> Result<QueryPager, NextRowError> {
-        self.maybe_append_timeout_override(&mut statement);
-        Arc::clone(&self.conn).query_iter(statement).await
-    }
+        let prepared: PreparedStatement =
+            self.get_or_prepare_statement(statement)
+                .await
+                .map_err(|attempt_err| {
+                    NextRowError::NextPageError(NextPageError::RequestFailure(attempt_err.into()))
+                })?;
 
-    pub(crate) async fn prepare(
-        &self,
-        mut statement: Statement,
-    ) -> Result<PreparedStatement, RequestAttemptError> {
-        self.maybe_append_timeout_override(&mut statement);
-        self.conn.prepare(&statement).await
-    }
-
-    /// Executes a prepared statements and fetches its results over multiple pages, using
-    /// the asynchronous iterator interface.
-    pub(crate) async fn execute_iter(
-        &self,
-        prepared_statement: PreparedStatement,
-        values: SerializedValues,
-    ) -> Result<QueryPager, NextRowError> {
+        let serialized_values = prepared.serialize_values(&values).map_err(|ser_err| {
+            NextRowError::NextPageError(NextPageError::RequestFailure(
+                RequestError::LastAttemptError(RequestAttemptError::SerializationError(ser_err)),
+            ))
+        })?;
         Arc::clone(&self.conn)
-            .execute_iter(prepared_statement, values)
+            .execute_iter(prepared, serialized_values)
             .await
     }
 }
@@ -108,6 +145,7 @@ mod tests {
 
     use std::num::NonZeroU16;
 
+    use crate::cluster::control_connection::ControlConnectionCache;
     use crate::cluster::metadata::UntranslatedEndpoint;
     use crate::cluster::node::ResolvedContactPoint;
     use crate::network::open_connection;
@@ -119,7 +157,6 @@ mod tests {
     /// Tests that ControlConnection enforces the provided custom timeout
     /// iff ScyllaDB is the target node (else ignores the custom timeout).
     #[tokio::test]
-    #[ntest::timeout(2000)]
     async fn test_custom_timeouts() {
         setup_tracing();
 
@@ -245,19 +282,16 @@ mod tests {
             .unwrap();
 
             let connected_to_scylladb = conn.get_shard_info().is_some();
-            let conn_with_default_timeout = ControlConnection::new(Arc::new(conn));
+            let conn_with_default_timeout = ControlConnection::new(
+                Arc::new(conn),
+                Arc::new(ControlConnectionCache::new()),
+                None,
+            );
 
             // No custom timeout set.
             {
                 conn_with_default_timeout
-                    .query_iter(QUERY_STR.into())
-                    .await
-                    .unwrap_err();
-
-                assert_no_custom_timeout(feedback_rx).await;
-
-                conn_with_default_timeout
-                    .prepare(QUERY_STR.into())
+                    .query_iter(QUERY_STR, &())
                     .await
                     .unwrap_err();
 
@@ -271,19 +305,7 @@ mod tests {
                     conn_with_default_timeout.override_serverside_timeout(Some(custom_timeout));
 
                 conn_with_custom_timeout
-                    .query_iter(QUERY_STR.into())
-                    .await
-                    .unwrap_err();
-
-                assert_custom_timeout_iff_scylladb(
-                    feedback_rx,
-                    custom_timeout,
-                    connected_to_scylladb,
-                )
-                .await;
-
-                conn_with_custom_timeout
-                    .prepare(QUERY_STR.into())
+                    .query_iter(QUERY_STR, &())
                     .await
                     .unwrap_err();
 

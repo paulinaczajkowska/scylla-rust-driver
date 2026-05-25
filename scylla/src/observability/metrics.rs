@@ -231,7 +231,7 @@ pub struct Metrics {
     histogram: Arc<AtomicHistogram>,
     /// Collects rates of queries executed by the driver.
     meter: Arc<RequestRateMeter>,
-    /// Total number of connections ever opened to the cluster by the driver.
+    /// Total number of active connections to the cluster (excluding control connections).
     total_connections: AtomicU64,
     connection_timeouts: AtomicU64,
     request_timeouts: AtomicU64,
@@ -467,11 +467,10 @@ impl Metrics {
             count += bucket.count() as u128;
         }
 
-        if count != 0 {
-            Ok((weighted_sum / count) as u64)
-        } else {
-            Err(MetricsError::Empty)
-        }
+        weighted_sum
+            .checked_div(count)
+            .map(|result| result as u64)
+            .ok_or(MetricsError::Empty)
     }
 
     fn percentiles(

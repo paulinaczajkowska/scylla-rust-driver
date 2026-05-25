@@ -12,14 +12,14 @@ use rcgen::{
 };
 use rustls::ClientConfig;
 use rustls::pki_types::PrivatePkcs8KeyDer;
-use scylla::client::session::{Session, TlsContext};
+use scylla::client::session::TlsContext;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
 use crate::ccm::lib::cluster::{Cluster, ClusterOptions};
 use crate::ccm::lib::node::Node;
 use crate::ccm::lib::{CLUSTER_VERSION, run_ccm_test_with_configuration};
-use crate::utils::{execute_unprepared_statement_everywhere, setup_tracing};
+use crate::utils::{check_session_works_and_fully_connected, setup_tracing};
 
 fn cluster_3_nodes() -> ClusterOptions {
     ClusterOptions {
@@ -131,33 +131,6 @@ async fn run_ccm_tls_test(
     .await
 }
 
-async fn check_session_works_and_fully_connected(expected_nodes: usize, session: &Session) {
-    let state = session.get_cluster_state();
-    assert_eq!(state.get_nodes_info().len(), expected_nodes);
-    assert!(
-        state
-            .get_nodes_info()
-            .iter()
-            .inspect(|node| {
-                tracing::debug!(
-                    "Node {}, address: {}, connected: {}",
-                    node.host_id,
-                    node.address,
-                    node.is_connected()
-                )
-            })
-            .all(|node| node.is_connected())
-    );
-    execute_unprepared_statement_everywhere(
-        session,
-        &state,
-        &"SELECT * FROM system.local WHERE key='local'".into(),
-        &(),
-    )
-    .await
-    .unwrap();
-}
-
 fn build_openssl_ca_store(ca: &CertifiedIssuer<'_, KeyPair>) -> X509Store {
     let mut store_builder = X509StoreBuilder::new().unwrap();
     let ca = X509::from_der(ca.der()).unwrap();
@@ -170,7 +143,6 @@ fn build_openssl_ca_store(ca: &CertifiedIssuer<'_, KeyPair>) -> X509Store {
 // It checks that driver can connect to all nodes of TLS-enabled cluster,
 // and execute requests on them.
 #[tokio::test]
-#[cfg_attr(not(ccm_tests), ignore)]
 async fn test_connect_tls_no_client_auth() {
     setup_tracing();
 
@@ -221,7 +193,6 @@ async fn test_connect_tls_no_client_auth() {
 // Verifies that if a node presents a certificate without a subject alternative name
 // matching the node's IP address, the driver won't connect to it.
 #[tokio::test]
-#[cfg_attr(not(ccm_tests), ignore)]
 async fn test_tls_verifies_hostname() {
     setup_tracing();
 
@@ -239,16 +210,13 @@ async fn test_tls_verifies_hostname() {
             let mut builder = SslContext::builder(SslMethod::tls()).unwrap();
             builder.set_verify(SslVerifyMode::PEER);
             builder.set_cert_store(build_openssl_ca_store(ca));
-            let session = cluster
+            let _err = cluster
                 .make_session_builder()
                 .await
                 .tls_context(Some(TlsContext::OpenSsl010(builder.build())))
                 .build()
                 .await
-                // This should be unwrap_err, but hostname verification doesn't work with openssl.
-                // This is a bug: https://github.com/scylladb/scylla-rust-driver/issues/1116
-                .unwrap();
-            check_session_works_and_fully_connected(cluster.nodes().len(), &session).await;
+                .unwrap_err();
         }
 
         {
@@ -273,7 +241,6 @@ async fn test_tls_verifies_hostname() {
 
 // Check that we can still connect if client_encryption_options.require_client_auth is true.
 #[tokio::test]
-#[cfg_attr(not(ccm_tests), ignore)]
 async fn test_connect_tls_with_client_auth() {
     setup_tracing();
 

@@ -31,8 +31,7 @@ use std::num::NonZeroU32;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use std::{env, iter};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -82,18 +81,9 @@ pub(crate) fn find_local_ip_for_destination(dest: IpAddr) -> Option<IpAddr> {
     IpAddr::from_str(local_ip_str).ok()
 }
 
-static UNIQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 pub(crate) fn unique_keyspace_name() -> String {
-    let cnt = UNIQUE_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let name = format!(
-        "test_rust_{}_{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-        cnt
-    );
+    let id = Uuid::new_v4();
+    let name = format!("test_rust_{}", id.as_simple(),);
     println!("Unique name: {name}");
     name
 }
@@ -106,11 +96,11 @@ where
     F: FnOnce([String; 3], HashMap<SocketAddr, SocketAddr>, RunningProxy) -> Fut,
     Fut: Future<Output = RunningProxy>,
 {
-    let real1_uri = env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+    let real1_uri = env::var("SCYLLA_URI").unwrap_or_else(|_| "172.42.0.2:9042".to_string());
     let proxy1_uri = format!("{}:9042", scylla_proxy::get_exclusive_local_address());
-    let real2_uri = env::var("SCYLLA_URI2").unwrap_or_else(|_| "127.0.0.2:9042".to_string());
+    let real2_uri = env::var("SCYLLA_URI2").unwrap_or_else(|_| "172.42.0.3:9042".to_string());
     let proxy2_uri = format!("{}:9042", scylla_proxy::get_exclusive_local_address());
-    let real3_uri = env::var("SCYLLA_URI3").unwrap_or_else(|_| "127.0.0.3:9042".to_string());
+    let real3_uri = env::var("SCYLLA_URI3").unwrap_or_else(|_| "172.42.0.4:9042".to_string());
     let proxy3_uri = format!("{}:9042", scylla_proxy::get_exclusive_local_address());
 
     let real1_addr = SocketAddr::from_str(real1_uri.as_str()).unwrap();
@@ -193,7 +183,7 @@ pub(crate) fn create_new_session_builder() -> GenericSessionBuilder<impl Session
     let session_builder = {
         use scylla::client::session_builder::SessionBuilder;
 
-        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "172.42.0.2:9042".to_string());
 
         SessionBuilder::new().known_node(uri)
     };
@@ -448,6 +438,42 @@ pub(crate) async fn execute_unprepared_statement_everywhere(
     .await
 }
 
+pub(crate) const HEALTHCHECK_QUERY: &str = "SELECT host_id FROM system.local WHERE key='local'";
+
+/// Checks that the session is connected to a cluster with expected number of nodes,
+/// that all nodes are connected (UP) and that a simple query can be executed everywhere.
+#[cfg_attr(
+    not(any(
+        all(scylla_unstable, feature = "unstable-host-listener"),
+        all(feature = "openssl-010", feature = "rustls-023")
+    )),
+    expect(dead_code)
+)]
+pub(crate) async fn check_session_works_and_fully_connected(
+    expected_nodes: usize,
+    session: &Session,
+) {
+    let state = session.get_cluster_state();
+    assert_eq!(state.get_nodes_info().len(), expected_nodes);
+    assert!(
+        state
+            .get_nodes_info()
+            .iter()
+            .inspect(|node| {
+                tracing::debug!(
+                    "Node {}, address: {}, connected: {}",
+                    node.host_id,
+                    node.address,
+                    node.is_connected()
+                )
+            })
+            .all(|node| node.is_connected())
+    );
+    execute_unprepared_statement_everywhere(session, &state, &HEALTHCHECK_QUERY.into(), &())
+        .await
+        .unwrap();
+}
+
 pub(crate) struct SerializeValueWithFakeType<'typ, T> {
     fake_type: ColumnType<'typ>,
     value: T,
@@ -476,7 +502,7 @@ impl<'typ, T> SerializeValueWithFakeType<'typ, T> {
 // and send OPTIONS request. If performance becomes a problem, we can do this.
 pub(crate) async fn fetch_negotiated_features(server: Option<String>) -> ProtocolFeatures {
     let real1_uri =
-        server.unwrap_or(env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string()));
+        server.unwrap_or(env::var("SCYLLA_URI").unwrap_or_else(|_| "172.42.0.2:9042".to_string()));
     let proxy1_uri = format!("{}:9042", scylla_proxy::get_exclusive_local_address());
     let real1_addr = SocketAddr::from_str(real1_uri.as_str()).unwrap();
     let proxy1_addr = SocketAddr::from_str(proxy1_uri.as_str()).unwrap();

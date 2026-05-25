@@ -1,8 +1,8 @@
 [package]
 name = "scylla-cql"
-version = "1.4.0"
+version = "1.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "CQL data types and primitives, for interacting with ScyllaDB."
 repository = "https://github.com/scylladb/scylla-rust-driver"
 readme = "../README.md"
@@ -13,9 +13,25 @@ license = "MIT OR Apache-2.0"
 [package.metadata."docs.rs"]
 all-features = true
 
+[package.metadata.cargo-semver-checks.lints]
+workspace = true
+
+[lints.rust]
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(scylla_unstable)',
+] }
+
+[[bench]]
+name = "benchmark"
+harness = false
+
 [features]
 # Enables support for CQL ser/de of Secrecy type from secrecy 0.8 crate.
 secrecy-08 = ["dep:secrecy-08"]
+# Enables support for CQL ser/de of Secrecy type from secrecy 0.10 crate.
+secrecy-10 = ["dep:secrecy-10"]
 # Enables support for CQL ser/de of time/date types from time 0.3 crate.
 time-03 = ["dep:time-03"]
 # Enables support for CQL ser/de of time/date types from chrono 0.4 crate.
@@ -31,10 +47,16 @@ full-serialization = [
     "chrono-04",
     "time-03",
     "secrecy-08",
+    "secrecy-10",
     "num-bigint-03",
     "num-bigint-04",
     "bigdecimal-04",
 ]
+
+### UNSTABLE FEATURES ###
+# Enables features for use in Node.js-RS Driver.
+unstable-nodejs-rs = []
+
 
 [dependencies]
 ###########################
@@ -43,7 +65,7 @@ full-serialization = [
 # Important: We use precise version of scylla-macros. This enables
 # us to make breaking changes in the doc(hidden) interfaces that are
 # used by macros.
-scylla-macros = { version = "=1.4.0", path = "../scylla-macros" }
+scylla-macros = { version = "=1.6.0", path = "../scylla-macros" }
 # AsyncRead trait used in read_response_frame
 tokio = { version = "1.40", features = ["io-util"] }
 # FrameSlice and other parts of public API
@@ -60,6 +82,7 @@ chrono-04 = { package = "chrono", version = "0.4.32", default-features = false, 
     "alloc",
 ] }
 secrecy-08 = { package = "secrecy", version = "0.8", optional = true }
+secrecy-10 = { package = "secrecy", version = "0.10", optional = true }
 num-bigint-03 = { package = "num-bigint", version = "0.3", optional = true }
 num-bigint-04 = { package = "num-bigint", version = "0.4", optional = true }
 bigdecimal-04 = { package = "bigdecimal", version = "0.4", optional = true }
@@ -93,17 +116,3 @@ criterion = "0.6"
 # Use large-dates feature to test potential edge cases
 time-03 = { package = "time", version = "0.3.21", features = ["large-dates"] }
 uuid = { version = "1.0", features = ["v4"] }
-
-[[bench]]
-name = "benchmark"
-harness = false
-
-[lints.rust]
-unnameable_types = "warn"
-unreachable_pub = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(nodejs_rs_unstable)',
-] }
-
-[package.metadata.cargo-semver-checks.lints]
-workspace = true

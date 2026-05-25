@@ -27,6 +27,15 @@ use crate::value::{
     CqlTimeuuid, CqlValue, CqlVarint, deser_cql_value,
 };
 
+// Re-export for backwards compatibility. These types were moved to crate::value module.
+// Note: deprecated doesn't work on re-exports, users won't get the warning.
+// Added it anyway for documentation purposes.
+// TODO(2.0): Remove those re-exports.
+#[deprecated(since = "1.5.0", note = "Moved to `scylla_cql::value` module")]
+pub use crate::value::Emptiable;
+#[deprecated(since = "1.5.0", note = "Moved to `scylla_cql::value` module")]
+pub use crate::value::MaybeEmpty;
+
 /// A type that can be deserialized from a column value inside a row that was
 /// returned from a query.
 ///
@@ -90,27 +99,6 @@ where
             .transpose()
             .map_err(deser_error_replace_rust_name::<Self>)
     }
-}
-
-/// Values that may be empty or not.
-///
-/// In CQL, some types can have a special value of "empty", represented as
-/// a serialized value of length 0. An example of this are integral types:
-/// the "int" type can actually hold 2^32 + 1 possible values because of this
-/// quirk. Note that this is distinct from being NULL.
-///
-/// Rust types that cannot represent an empty value (e.g. i32) should implement
-/// this trait in order to be deserialized as [MaybeEmpty].
-pub trait Emptiable {}
-
-/// A value that may be empty or not.
-///
-/// `MaybeEmpty` was introduced to help support the quirk described in [Emptiable]
-/// for Rust types which can't represent the empty, additional value.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
-pub enum MaybeEmpty<T: Emptiable> {
-    Empty,
-    Value(T),
 }
 
 impl<'frame, 'metadata, T> DeserializeValue<'frame, 'metadata> for MaybeEmpty<T>
@@ -675,6 +663,66 @@ where
     ) -> Result<Self, DeserializationError> {
         <T as DeserializeValue<'frame, 'metadata>>::deserialize(typ, v)
             .map(secrecy_08::Secret::new)
+            .map_err(deser_error_replace_rust_name::<Self>)
+    }
+}
+
+#[cfg(feature = "secrecy-10")]
+impl<'frame, 'metadata, T> DeserializeValue<'frame, 'metadata> for secrecy_10::SecretBox<T>
+where
+    T: DeserializeValue<'frame, 'metadata> + secrecy_10::zeroize::Zeroize,
+{
+    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
+        <T as DeserializeValue<'frame, 'metadata>>::type_check(typ)
+            .map_err(typck_error_replace_rust_name::<Self>)
+    }
+
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        <T as DeserializeValue<'frame, 'metadata>>::deserialize(typ, v)
+            .map(|v| secrecy_10::SecretBox::new(Box::new(v)))
+            .map_err(deser_error_replace_rust_name::<Self>)
+    }
+}
+
+// Special implementation for SecretString (SecretBox<str>)
+#[cfg(feature = "secrecy-10")]
+impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for secrecy_10::SecretString {
+    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
+        <String as DeserializeValue<'frame, 'metadata>>::type_check(typ)
+            .map_err(typck_error_replace_rust_name::<Self>)
+    }
+
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        <String as DeserializeValue<'frame, 'metadata>>::deserialize(typ, v)
+            .map(secrecy_10::SecretString::from)
+            .map_err(deser_error_replace_rust_name::<Self>)
+    }
+}
+
+// Special implementation for SecretSlice (SecretBox<[S]>)
+#[cfg(feature = "secrecy-10")]
+impl<'frame, 'metadata, S> DeserializeValue<'frame, 'metadata> for secrecy_10::SecretSlice<S>
+where
+    S: DeserializeValue<'frame, 'metadata> + secrecy_10::zeroize::Zeroize,
+    [S]: secrecy_10::zeroize::Zeroize,
+{
+    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
+        <Vec<S> as DeserializeValue<'frame, 'metadata>>::type_check(typ)
+            .map_err(typck_error_replace_rust_name::<Self>)
+    }
+
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        <Vec<S> as DeserializeValue<'frame, 'metadata>>::deserialize(typ, v)
+            .map(secrecy_10::SecretSlice::from)
             .map_err(deser_error_replace_rust_name::<Self>)
     }
 }
@@ -1566,6 +1614,25 @@ impl<'frame, 'metadata, T: DeserializeValue<'frame, 'metadata>> DeserializeValue
     ) -> Result<Self, DeserializationError> {
         T::deserialize(typ, v)
             .map(Arc::new)
+            .map_err(deser_error_replace_rust_name::<Self>)
+    }
+}
+
+impl<'frame, 'metadata, T: 'frame + ToOwned + ?Sized> DeserializeValue<'frame, 'metadata>
+    for Cow<'frame, T>
+where
+    &'frame T: DeserializeValue<'frame, 'metadata>,
+{
+    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
+        <&T>::type_check(typ).map_err(typck_error_replace_rust_name::<Self>)
+    }
+
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        <&T>::deserialize(typ, v)
+            .map(Cow::Borrowed)
             .map_err(deser_error_replace_rust_name::<Self>)
     }
 }

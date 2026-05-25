@@ -113,7 +113,8 @@ pub mod value {
     // Every `pub` item is re-exported here, apart from `deser_cql_value`.
     pub use scylla_cql::value::{
         Counter, CqlDate, CqlDecimal, CqlDecimalBorrowed, CqlDuration, CqlTime, CqlTimestamp,
-        CqlTimeuuid, CqlValue, CqlVarint, CqlVarintBorrowed, MaybeUnset, Row, Unset, ValueOverflow,
+        CqlTimeuuid, CqlValue, CqlVarint, CqlVarintBorrowed, Emptiable, MaybeEmpty, MaybeUnset,
+        Row, Unset, ValueOverflow,
     };
 }
 
@@ -142,7 +143,7 @@ pub mod frame {
             //!
             //! Contains lower-level types that are used to represent the result of a query.
 
-            #[cfg(cpp_rust_unstable)]
+            #[cfg(all(scylla_unstable, feature = "unstable-cpp-rs"))]
             pub use scylla_cql::frame::response::result::DeserializedMetadataAndRawRows;
 
             pub(crate) use scylla_cql::frame::response::result::*;
@@ -226,12 +227,18 @@ pub mod deserialize {
     pub mod value {
         pub use scylla_cql::deserialize::value::{
             BuiltinDeserializationError, BuiltinDeserializationErrorKind, BuiltinTypeCheckError,
-            BuiltinTypeCheckErrorKind, DeserializeValue, Emptiable, ListlikeIterator,
-            MapDeserializationErrorKind, MapIterator, MapTypeCheckErrorKind, MaybeEmpty,
+            BuiltinTypeCheckErrorKind, DeserializeValue, ListlikeIterator,
+            MapDeserializationErrorKind, MapIterator, MapTypeCheckErrorKind,
             SetOrListDeserializationErrorKind, SetOrListTypeCheckErrorKind,
             TupleDeserializationErrorKind, TupleTypeCheckErrorKind, UdtIterator,
             UdtTypeCheckErrorKind,
         };
+
+        // Note: deprecated doesn't work on re-exports, users won't get the warning.
+        // Added it anyway for documentation purposes.
+        // TODO(2.0): Remove those re-exports.
+        #[deprecated(since = "1.5.0", note = "Moved to `scylla::value` module")]
+        pub use scylla_cql::deserialize::value::{Emptiable, MaybeEmpty};
     }
 
     // Shorthands for better readability.
@@ -262,7 +269,10 @@ pub(crate) mod utils;
 #[cfg(test)]
 pub(crate) use utils::test_utils;
 
-#[cfg(feature = "unstable-testing")]
+#[cfg(doctest)]
+mod book_tests;
+
+#[cfg(all(scylla_unstable, feature = "unstable-testing"))]
 #[doc(hidden)]
 pub mod internal_testing {
     use scylla_cql::serialize::row::SerializedValues;

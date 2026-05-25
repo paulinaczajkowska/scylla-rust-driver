@@ -50,6 +50,11 @@ impl TlsProvider {
     ) -> Option<TlsConfig> {
         match self {
             TlsProvider::GlobalContext(context) => {
+                #[cfg_attr(
+                    not(any(feature = "openssl-010", feature = "rustls-023")),
+                    // TODO: make this expect() once MSRV is 1.92+.
+                    allow(unreachable_code)
+                )]
                 Some(TlsConfig::new_with_global_context(context.clone()))
             }
         }
@@ -123,6 +128,7 @@ impl TlsConfig {
             TlsContext::OpenSsl010(ref context) => {
                 #[allow(unused_mut)]
                 let mut ssl = openssl::ssl::Ssl::new(context)?;
+                ssl.set_connect_state();
                 Ok(Tls::OpenSsl010(ssl))
             }
             #[cfg(feature = "rustls-023")]

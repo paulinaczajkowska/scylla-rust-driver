@@ -1,10 +1,12 @@
 COMPOSE := docker compose -f test/cluster/docker-compose.yml
+RUSTFLAGS := ${RUSTFLAGS} --cfg scylla_unstable
+export RUSTFLAGS
 
 .PHONY: all
 all: test
 
 .PHONY: static
-static: fmt-check check check-without-features check-all-features clippy clippy-all-features clippy-cpp-rust
+static: fmt-check check check-without-features check-without-unstable check-without-unstable-and-features check-all-features clippy clippy-all-features check-book-tests
 
 .PHONY: ci
 ci: static test
@@ -26,7 +28,19 @@ check:
 
 .PHONY: check-without-features
 check-without-features:
-	cargo check -p scylla --features "" --all-targets
+	# If we pass --all-targets here, feature unification turns on some features anyway,
+	# so we only check the main target.
+	cargo check -p scylla
+
+.PHONY: check-without-unstable
+check-without-unstable:
+	RUSTFLAGS="" cargo check -p scylla --all-targets
+
+.PHONY: check-without-unstable-and-features
+check-without-unstable-and-features:
+	# If we pass --all-targets here, feature unification turns on some features anyway,
+	# so we only check the main target.
+	RUSTFLAGS="" cargo check -p scylla
 
 .PHONY: check-all-features
 check-all-features:
@@ -34,27 +48,23 @@ check-all-features:
 
 .PHONY: clippy
 clippy:
-	RUSTFLAGS=-Dwarnings cargo clippy --all-targets
+	RUSTFLAGS="${RUSTFLAGS} -Dwarnings" cargo clippy --all-targets
 
 .PHONY: clippy-all-features
 clippy-all-features:
-	RUSTFLAGS=-Dwarnings cargo clippy --all-targets --all-features
-
-.PHONY: clippy-cpp-rust
-clippy-cpp-rust:
-	RUSTFLAGS="--cfg cpp_rust_unstable -Dwarnings" cargo clippy --all-targets --all-features
+	RUSTFLAGS="${RUSTFLAGS} -Dwarnings" cargo clippy --all-targets --all-features
 
 
 .PHONY: test
 test: up
-	SCYLLA_URI=172.42.0.2:9042 \
-	 SCYLLA_URI2=172.42.0.3:9042 \
-	 SCYLLA_URI3=172.42.0.4:9042 \
-	 cargo test
+	# We need to run doctests separately, because nextest doesn't support them :(
+	# https://github.com/nextest-rs/nextest/issues/16
+	cargo test --doc --all-features
+	cargo nextest run --all-features
 
 .PHONY: ccm-test
 ccm-test:
-	RUSTFLAGS="${RUSTFLAGS} --cfg ccm_tests" cargo test --test integration ccm
+	cargo nextest run --all-features -E 'test(ccm::)' --ignore-default-filter --status-level pass
 
 .PHONY: dockerized-test
 dockerized-test: up
@@ -67,6 +77,14 @@ build:
 .PHONY: docs
 docs:
 	mdbook build docs
+
+.PHONY: check-book-tests
+check-book-tests:
+	cargo run -p generate_book_tests -- --check
+
+.PHONY: regenerate-book-tests
+regenerate-book-tests:
+	cargo run -p generate_book_tests
 
 .PHONY: semver-rev
 semver-rev:

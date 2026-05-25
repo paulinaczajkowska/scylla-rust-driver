@@ -15,7 +15,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[tokio::test]
-#[ntest::timeout(60000)]
 async fn batch_statements_and_values_mismatch_detected() {
     setup_tracing();
     let session = create_new_session_builder().build().await.unwrap();
@@ -82,6 +81,7 @@ async fn batch_statements_and_values_mismatch_detected() {
 }
 
 #[tokio::test]
+#[cfg_attr(cassandra_tests, ignore)]
 async fn test_large_batch_statements() {
     setup_tracing();
     let mut session = create_new_session_builder().build().await.unwrap();
@@ -104,7 +104,7 @@ async fn test_large_batch_statements() {
     session.ddl(format!("DROP KEYSPACE {ks}")).await.unwrap();
 }
 
-async fn create_test_session(session: Session, ks: &String) -> Session {
+async fn create_test_session(session: Session, ks: &str) -> Session {
     session
         .ddl(
             format!("CREATE KEYSPACE {ks} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }}"),
@@ -119,11 +119,7 @@ async fn create_test_session(session: Session, ks: &String) -> Session {
     session
 }
 
-async fn write_batch(
-    session: &Session,
-    n: usize,
-    ks: &String,
-) -> Result<QueryResult, ExecutionError> {
+async fn write_batch(session: &Session, n: usize, ks: &str) -> Result<QueryResult, ExecutionError> {
     let mut batch_query = Batch::new(BatchType::Unlogged);
     let mut batch_values = Vec::new();
     let statement_str = format!("INSERT INTO {ks}.pairs (dummy, k, v) VALUES (0, ?, ?)");

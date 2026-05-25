@@ -1,4 +1,6 @@
 mod cli_wrapper;
+#[cfg(feature = "unstable-client-routes")]
+pub(crate) mod client_routes;
 pub(crate) mod cluster;
 mod ip_allocator;
 mod logged_cmd;
@@ -15,7 +17,7 @@ use ip_allocator::IpAllocator;
 use tracing::info;
 
 pub(crate) static CLUSTER_VERSION: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("SCYLLA_TEST_CLUSTER").unwrap_or("release:2025.3.3".to_string())
+    std::env::var("SCYLLA_TEST_CLUSTER").unwrap_or("release:2026.1.0".to_string())
 });
 
 static TEST_KEEP_CLUSTER_ON_FAILURE: LazyLock<bool> = LazyLock::new(|| {
@@ -52,7 +54,7 @@ static ROOT_CCM_DIR: LazyLock<String> = LazyLock::new(|| {
     let path = PathBuf::from(&ccm_root_dir);
     if !path.try_exists().unwrap() {
         info!("Directory {:?} not found, creating", path);
-        std::fs::create_dir(path).unwrap();
+        std::fs::create_dir_all(path).unwrap();
     }
 
     ccm_root_dir

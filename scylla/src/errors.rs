@@ -137,6 +137,18 @@ pub enum PagerExecutionError {
     /// Failed to fetch the first page of the result.
     #[error("Failed to fetch the first page of the result: {0}")]
     NextPageError(#[from] NextPageError),
+
+    /// 'USE KEYSPACE <>' request failed.
+    #[error("'USE KEYSPACE <>' request failed: {0}")]
+    UseKeyspaceError(#[from] UseKeyspaceError),
+
+    /// Failed to await automatic schema agreement.
+    #[error("Failed to await schema agreement: {0}")]
+    SchemaAgreementError(#[from] SchemaAgreementError),
+
+    /// Failed when refreshing metadata after schema agreement was reached.
+    #[error("Failed when refreshing metadata after schema agreement was reached: {0}")]
+    MetadataError(#[from] MetadataError),
 }
 
 /// Error that occurred during session creation
@@ -159,6 +171,10 @@ pub enum NewSessionError {
     /// 'USE KEYSPACE <>' request failed.
     #[error("'USE KEYSPACE <>' request failed: {0}")]
     UseKeyspaceError(#[from] UseKeyspaceError),
+
+    /// Provided combination of Session configuration options is unsupported.
+    #[error("Provided combination of Session configuration options is unsupported: {0}")]
+    IllegalConfig(Box<str>),
 }
 
 /// An error that occurred during `USE KEYSPACE <>` request.
@@ -200,6 +216,10 @@ pub enum SchemaAgreementError {
     #[error("Failed to find a node with working connection pool: {0}")]
     ConnectionPoolError(#[from] ConnectionPoolError),
 
+    /// Failed to prepare the schema version query.
+    #[error("Failed to prepare schema version query: {0}")]
+    PrepareError(#[from] PrepareError),
+
     /// Failed to execute schema version query on one of the connections.
     ///
     /// The driver attempts to fetch schema version on all connections in the pool (for all nodes).
@@ -209,6 +229,10 @@ pub enum SchemaAgreementError {
     RequestError(#[from] RequestAttemptError),
 
     /// Failed to convert schema version query result into rows result.
+    ///
+    /// This variant should be named `SchemaVersionIntoRowsResultError`, current name
+    /// is a copy-paste error. It will be renamed in 2.0
+    //TODO(2.0): Rename to `SchemaVersionIntoRowsResultError`
     #[error("Failed to convert schema version query result into rows result: {0}")]
     TracesEventsIntoRowsResultError(IntoRowsResultError),
 
@@ -237,6 +261,10 @@ pub enum TracingError {
         "Failed to execute queries to \"system_traces.sessions\" or \"system_traces.events\" system tables: {0}"
     )]
     ExecutionError(#[from] ExecutionError),
+
+    /// Failed to prepare a tracing query.
+    #[error("Failed to prepare tracing query: {0}")]
+    PrepareError(#[from] PrepareError),
 
     /// Failed to convert result of system_traces.session query to rows result.
     #[error("Failed to convert result of system_traces.session query to rows result")]
@@ -285,15 +313,17 @@ pub enum TracingError {
 /// The errors that occur during metadata fetch are contained in [`MetadataFetchError`].
 /// Remaining errors (logical errors) are contained in the variants corresponding to the
 /// specific part of the metadata.
+// TODO(2.0): reduce size of this type.
 #[derive(Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum MetadataError {
+    //TODO(2.0): Change this to `ConnectionError`. Control connection no longer uses a connection pool.
     /// Control connection pool error.
     #[error("Control connection pool error: {0}")]
     ConnectionPoolError(#[from] ConnectionPoolError),
 
     /// Failed to fetch metadata.
-    #[error("transparent")]
+    #[error(transparent)]
     FetchError(#[from] MetadataFetchError),
 
     /// Bad peers metadata.
@@ -311,6 +341,10 @@ pub enum MetadataError {
     /// Bad tables metadata.
     #[error("Bad tables metadata: {0}")]
     Tables(#[from] TablesMetadataError),
+
+    /// Bad client routes metadata.
+    #[error("Bad client routes metadata: {0}")]
+    ClientRoutes(#[from] ClientRoutesMetadataError),
 }
 
 /// An error occurred during metadata fetch.
@@ -454,6 +488,20 @@ pub enum TablesMetadataError {
     },
 }
 
+/// An error that occurred during client routes metadata fetch.
+#[derive(Error, Debug, Clone)]
+#[non_exhaustive]
+pub enum ClientRoutesMetadataError {
+    /// Failed to parse CQL type returned from system.client_routes query.
+    #[error("Invalid port value: {port}, is TLS port? {is_tls}")]
+    InvalidPortValue {
+        /// Invalid port value.
+        port: i32,
+        /// Whether the port is the TLS port (ordinary port otherwise)
+        is_tls: bool,
+    },
+}
+
 /// Error caused by caller creating an invalid statement.
 #[derive(Error, Debug, Clone)]
 #[error("Invalid statement passed to Session")]
@@ -567,7 +615,9 @@ impl ConnectionError {
     pub fn is_address_unavailable_for_use(&self) -> bool {
         if let ConnectionError::IoError(io_error) = self {
             match io_error.kind() {
-                ErrorKind::AddrInUse | ErrorKind::PermissionDenied => return true,
+                ErrorKind::AddrInUse
+                | ErrorKind::PermissionDenied
+                | ErrorKind::AddrNotAvailable => return true,
                 _ => {}
             }
         }
@@ -602,6 +652,10 @@ pub enum TranslationError {
     #[error("No rule for address {0}")]
     NoRuleForAddress(SocketAddr),
 
+    /// Driver failed to find a translation rule for a provided host id.
+    #[error("No rule for host with id {0}")]
+    NoRuleForHost(Uuid),
+
     /// A translation rule for a provided address was found, but the translated address was invalid.
     #[error("Failed to parse translated address: {translated_addr_str}, reason: {reason}")]
     InvalidAddressInRule {
@@ -615,9 +669,32 @@ pub enum TranslationError {
     #[error("An I/O error occurred during address translation: {0}")]
     IoError(Arc<std::io::Error>),
 
+    /// DNS lookup failed during address translation.
+    #[error("DNS lookup failed: {0}")]
+    DnsLookupFailed(DnsLookupError),
+
+    /// system.client_routes is missing a port for a host.
+    #[error("Missing port for host {0} in system.client_routes")]
+    MissingPortForHost(Uuid),
+
     /// Custom error, for example from user-implemented policy.
     #[error(transparent)]
     Custom(#[from] CustomTranslationError),
+}
+
+/// Error that occurred during DNS lookup.
+#[derive(Error, Debug, Clone)]
+#[non_exhaustive]
+pub enum DnsLookupError {
+    /// Timed out during DNS lookup.
+    #[error("Failed to perform DNS lookup within {0}ms")]
+    Timeout(u128),
+    /// DNS lookup returned an empty address list for a given hostname.
+    #[error("Empty address list returned by DNS for {0}")]
+    EmptyAddressListForHost(Box<str>),
+    /// I/O error occurred during DNS lookup.
+    #[error("An I/O error occurred during DNS lookup: {0}")]
+    IoError(Arc<std::io::Error>),
 }
 
 /// An error that occurred during connection setup request execution.

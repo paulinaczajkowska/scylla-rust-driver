@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::env;
 use std::sync::Arc;
 
 use itertools::Itertools as _;
@@ -148,9 +150,6 @@ async fn test_schema_types_in_metadata() {
         .await
         .unwrap();
 
-    session.await_schema_agreement().await.unwrap();
-    session.refresh_metadata().await.unwrap();
-
     let cluster_state = session.get_cluster_state();
     let tables = &cluster_state.get_keyspace(&ks).unwrap().tables;
 
@@ -280,9 +279,6 @@ async fn test_user_defined_types_in_metadata() {
         .await
         .unwrap();
 
-    session.await_schema_agreement().await.unwrap();
-    session.refresh_metadata().await.unwrap();
-
     let cluster_state = session.get_cluster_state();
     let user_defined_types = &cluster_state.get_keyspace(&ks).unwrap().user_defined_types;
 
@@ -337,9 +333,6 @@ async fn test_column_kinds_in_metadata() {
         .await
         .unwrap();
 
-    session.await_schema_agreement().await.unwrap();
-    session.refresh_metadata().await.unwrap();
-
     let cluster_state = session.get_cluster_state();
     let columns = &cluster_state.get_keyspace(&ks).unwrap().tables["t"].columns;
 
@@ -387,9 +380,6 @@ async fn test_primary_key_ordering_in_metadata() {
         .await
         .unwrap();
 
-    session.await_schema_agreement().await.unwrap();
-    session.refresh_metadata().await.unwrap();
-
     let cluster_state = session.get_cluster_state();
     let table = &cluster_state.get_keyspace(&ks).unwrap().tables["t"];
 
@@ -429,9 +419,6 @@ async fn test_table_partitioner_in_metadata() {
         .await
         .unwrap();
 
-    session.await_schema_agreement().await.unwrap();
-    session.refresh_metadata().await.unwrap();
-
     let cluster_state = session.get_cluster_state();
     let tables = &cluster_state.get_keyspace(&ks).unwrap().tables;
     let table = &tables["t"];
@@ -447,6 +434,7 @@ async fn test_table_partitioner_in_metadata() {
 }
 
 #[tokio::test]
+#[cfg_attr(cassandra_tests, ignore)]
 async fn test_views_in_schema_info() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -471,9 +459,6 @@ async fn test_views_in_schema_info() {
     session.ddl("CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM t WHERE v IS NOT NULL PRIMARY KEY (v, id)").await.unwrap();
     session.ddl("CREATE MATERIALIZED VIEW mv2 AS SELECT id, v FROM t WHERE v IS NOT NULL PRIMARY KEY (v, id)").await.unwrap();
 
-    session.await_schema_agreement().await.unwrap();
-    session.refresh_metadata().await.unwrap();
-
     let keyspace_meta = session
         .get_cluster_state()
         .get_keyspace(&ks)
@@ -483,27 +468,23 @@ async fn test_views_in_schema_info() {
     let tables = keyspace_meta
         .tables
         .keys()
-        .collect::<std::collections::HashSet<&String>>();
+        .map(|s| s.as_str())
+        .collect::<std::collections::HashSet<&str>>();
 
     let views = keyspace_meta
         .views
         .keys()
-        .collect::<std::collections::HashSet<&String>>();
+        .map(|s| s.as_str())
+        .collect::<std::collections::HashSet<&str>>();
     let views_base_table = keyspace_meta
         .views
         .values()
-        .map(|view_meta| &view_meta.base_table_name)
-        .collect::<std::collections::HashSet<&String>>();
+        .map(|view_meta| view_meta.base_table_name.as_str())
+        .collect::<std::collections::HashSet<&str>>();
 
-    assert_eq!(tables, std::collections::HashSet::from([&"t".to_string()]));
-    assert_eq!(
-        views,
-        std::collections::HashSet::from([&"mv1".to_string(), &"mv2".to_string()])
-    );
-    assert_eq!(
-        views_base_table,
-        std::collections::HashSet::from([&"t".to_string()])
-    );
+    assert_eq!(tables, std::collections::HashSet::from(["t"]));
+    assert_eq!(views, std::collections::HashSet::from(["mv1", "mv2"]));
+    assert_eq!(views_base_table, std::collections::HashSet::from(["t"]));
 
     session.ddl(format!("DROP KEYSPACE {ks}")).await.unwrap();
 }
@@ -529,4 +510,71 @@ async fn test_fetch_system_keyspace() {
         .rows::<Row>()
         .unwrap()
         .for_each(|_| ());
+}
+
+#[tokio::test]
+async fn test_durable_writes_in_metadata() {
+    setup_tracing();
+    let session = create_new_session_builder().build().await.unwrap();
+    let ks_durable = unique_keyspace_name();
+    let ks_non_durable = unique_keyspace_name();
+
+    // Create a keyspace with durable_writes explicitly set to true
+    session
+        .ddl(format!(
+            "CREATE KEYSPACE {ks_durable} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}} AND DURABLE_WRITES = true"
+        ))
+        .await
+        .unwrap();
+
+    // Create a keyspace with durable_writes explicitly set to false
+    session
+        .ddl(format!(
+            "CREATE KEYSPACE {ks_non_durable} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}} AND DURABLE_WRITES = false"
+        ))
+        .await
+        .unwrap();
+
+    let cluster_state = session.get_cluster_state();
+
+    let ks_durable_meta = cluster_state.get_keyspace(&ks_durable).unwrap();
+    assert!(ks_durable_meta.durable_writes);
+
+    let ks_non_durable_meta = cluster_state.get_keyspace(&ks_non_durable).unwrap();
+    assert!(!ks_non_durable_meta.durable_writes);
+
+    session
+        .ddl(format!("DROP KEYSPACE {ks_durable}"))
+        .await
+        .unwrap();
+    session
+        .ddl(format!("DROP KEYSPACE {ks_non_durable}"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_session_should_have_topology_metadata() {
+    setup_tracing();
+    let session = create_new_session_builder().build().await.unwrap();
+    let state = session.get_cluster_state();
+
+    let expected_addresses: HashSet<String> = [
+        env::var("SCYLLA_URI").unwrap_or_else(|_| "172.42.0.2:9042".to_string()),
+        env::var("SCYLLA_URI2").unwrap_or_else(|_| "172.42.0.3:9042".to_string()),
+        env::var("SCYLLA_URI3").unwrap_or_else(|_| "172.42.0.4:9042".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let got_addresses: HashSet<String> = state
+        .get_nodes_info()
+        .iter()
+        .map(|node| node.address.to_string())
+        .collect();
+
+    assert_eq!(
+        got_addresses, expected_addresses,
+        "Cluster node addresses do not match environment variables"
+    );
 }

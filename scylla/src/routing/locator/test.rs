@@ -122,6 +122,7 @@ pub(crate) fn mock_metadata_for_token_aware_tests() -> Metadata {
                 strategy: Strategy::SimpleStrategy {
                     replication_factor: 2,
                 },
+                durable_writes: true,
                 tables: HashMap::new(),
                 views: HashMap::new(),
                 user_defined_types: HashMap::new(),
@@ -135,6 +136,7 @@ pub(crate) fn mock_metadata_for_token_aware_tests() -> Metadata {
                         .into_iter()
                         .collect(),
                 },
+                durable_writes: true,
                 tables: HashMap::new(),
                 views: HashMap::new(),
                 user_defined_types: HashMap::new(),
@@ -148,6 +150,7 @@ pub(crate) fn mock_metadata_for_token_aware_tests() -> Metadata {
                         .into_iter()
                         .collect(),
                 },
+                durable_writes: true,
                 tables: HashMap::new(),
                 views: HashMap::new(),
                 user_defined_types: HashMap::new(),
@@ -161,6 +164,7 @@ pub(crate) fn mock_metadata_for_token_aware_tests() -> Metadata {
     Metadata {
         peers: Vec::from(peers),
         keyspaces,
+        client_routes_updated_hosts: Default::default(),
     }
 }
 
@@ -181,10 +185,12 @@ pub(crate) fn create_ring(metadata: &Metadata) -> impl Iterator<Item = (Token, A
     let pool_config: PoolConfig = Default::default();
     let mut ring: Vec<(Token, Arc<Node>)> = Vec::new();
 
+    let (connectivity_events_sender, _) = tokio::sync::mpsc::unbounded_channel();
     for peer in &metadata.peers {
         let node = Arc::new(Node::new(
             peer.to_peer_endpoint(),
             &pool_config,
+            connectivity_events_sender.clone(),
             None,
             true,
             #[cfg(feature = "metrics")]

@@ -1,12 +1,11 @@
 use itertools::Itertools;
-use thiserror::Error;
 use tokio::net::{ToSocketAddrs, lookup_host};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::errors::{ConnectionPoolError, UseKeyspaceError};
-use crate::network::Connection;
+use crate::errors::{ConnectionPoolError, DnsLookupError, UseKeyspaceError};
 use crate::network::VerifiedKeyspaceName;
+use crate::network::{Connection, ConnectivityChangeEvent};
 use crate::network::{NodeConnectionPool, PoolConfig};
 #[cfg(feature = "metrics")]
 use crate::observability::metrics::Metrics;
@@ -26,19 +25,22 @@ use std::{
 
 use crate::cluster::metadata::{PeerEndpoint, UntranslatedEndpoint};
 
-/// This enum is introduced to support address translation only upon opening a connection,
-/// as well as to cope with a bug present in older Cassandra and ScyllaDB releases.
-/// The bug involves misconfiguration of rpc_address and/or broadcast_rpc_address
-/// in system.local to 0.0.0.0. Mitigation involves replacing the faulty address
-/// with connection's address, but then that address must not be subject to `AddressTranslator`,
-/// so we carry that information using this enum. Address translation is never performed
-/// on `Untranslatable` variant.
+/// This enum is introduced to support address translation only upon opening a connection.
+///
+/// Address translation is never performed on `Untranslatable` variant, which is intended for
+/// contact points. The `Translatable` variant is used for addresses broadcast by nodes themselves.
+///
+/// Historically, this enum had another use: to cope with a bug present in older Cassandra and ScyllaDB
+/// releases: <https://github.com/scylladb/scylladb/issues/11201>. The bug involved misconfiguration
+/// of rpc_address and/or broadcast_rpc_address in system.local to 0.0.0.0. Mitigation involved
+/// replacing the faulty address with connection's address, but then that address had to not be subject
+/// to `AddressTranslator`, so we carried that information using this enum.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NodeAddr {
     /// Fetched in Metadata with `query_peers()` (broadcast by a node itself).
     Translatable(SocketAddr),
-    /// Built from control connection's address upon `query_peers()` in order to mitigate the bug described above.
+    /// Stores contact points, because they are provided as already translated addresses.
     Untranslatable(SocketAddr),
 }
 
@@ -116,6 +118,7 @@ impl Node {
     pub(crate) fn new(
         peer: PeerEndpoint,
         pool_config: &PoolConfig,
+        connectivity_events_sender: tokio::sync::mpsc::UnboundedSender<ConnectivityChangeEvent>,
         keyspace_name: Option<VerifiedKeyspaceName>,
         enabled: bool,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
@@ -126,11 +129,12 @@ impl Node {
         let rack = peer.rack.clone();
 
         // We aren't interested in the fact that the pool becomes empty, so we immediately drop the receiving part.
-        let (pool_empty_notifier, _) = tokio::sync::broadcast::channel(1);
+        let (pool_empty_notifier, _) = tokio::sync::mpsc::channel(1);
         let pool = enabled.then(|| {
             NodeConnectionPool::new(
                 UntranslatedEndpoint::Peer(peer),
                 pool_config,
+                Some((host_id, connectivity_events_sender)),
                 keyspace_name,
                 pool_empty_notifier,
                 #[cfg(feature = "metrics")]
@@ -213,6 +217,16 @@ impl Node {
         self.pool.is_some()
     }
 
+    /// Signals the node's connection pool to retry connecting immediately,
+    /// resetting its exponential backoff.
+    ///
+    /// This is a no-op if the node has no pool (disabled by host filter).
+    pub(crate) fn trigger_pool_refill(&self) {
+        if let Some(pool) = &self.pool {
+            pool.trigger_immediate_refill();
+        }
+    }
+
     pub(crate) async fn use_keyspace(
         &self,
         keyspace_name: VerifiedKeyspaceName,
@@ -278,16 +292,6 @@ pub(crate) struct ResolvedContactPoint {
     pub(crate) address: SocketAddr,
 }
 
-#[derive(Error, Debug)]
-pub(crate) enum DnsLookupError {
-    #[error("Failed to perform DNS lookup within {0}ms")]
-    Timeout(u128),
-    #[error("Empty address list returned by DNS for {0}")]
-    EmptyAddressListForHost(String),
-    #[error(transparent)]
-    IoError(#[from] std::io::Error),
-}
-
 /// Performs a DNS lookup with provided optional timeout.
 async fn lookup_host_with_timeout(
     host: impl ToSocketAddrs,
@@ -295,12 +299,14 @@ async fn lookup_host_with_timeout(
 ) -> Result<impl Iterator<Item = SocketAddr>, DnsLookupError> {
     if let Some(timeout) = hostname_resolution_timeout {
         match tokio::time::timeout(timeout, lookup_host(host)).await {
-            Ok(res) => res.map_err(Into::into),
+            Ok(res) => res.map_err(|io_err| DnsLookupError::IoError(Arc::new(io_err))),
             // Elapsed error from tokio library does not provide any context.
             Err(_) => Err(DnsLookupError::Timeout(timeout.as_millis())),
         }
     } else {
-        lookup_host(host).await.map_err(Into::into)
+        lookup_host(host)
+            .await
+            .map_err(|io_err| DnsLookupError::IoError(Arc::new(io_err)))
     }
 }
 
@@ -332,7 +338,7 @@ pub(crate) async fn resolve_hostname(
 
     addrs
         .find_or_last(|addr| matches!(addr, SocketAddr::V4(_)))
-        .ok_or_else(|| DnsLookupError::EmptyAddressListForHost(hostname.to_owned()))
+        .ok_or_else(|| DnsLookupError::EmptyAddressListForHost(hostname.into()))
 }
 
 /// Transforms the given [`InternalKnownNode`]s into [`ContactPoint`]s.
@@ -346,13 +352,13 @@ pub(crate) async fn resolve_contact_points(
     // Find IP addresses of all known nodes passed in the config
     let mut initial_peers: Vec<ResolvedContactPoint> = Vec::with_capacity(known_nodes.len());
 
-    let mut to_resolve: Vec<&String> = Vec::new();
+    let mut to_resolve: Vec<&str> = Vec::new();
     let mut hostnames: Vec<String> = Vec::new();
 
     for node in known_nodes.iter() {
         match node {
             KnownNode::Hostname(hostname) => {
-                to_resolve.push(hostname);
+                to_resolve.push(hostname.as_str());
                 hostnames.push(hostname.clone());
             }
             KnownNode::Address(address) => {

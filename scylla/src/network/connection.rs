@@ -8,15 +8,15 @@ use crate::cluster::metadata::{PeerEndpoint, UntranslatedEndpoint};
 use crate::errors::{
     BadKeyspaceName, BrokenConnectionError, BrokenConnectionErrorKind, ConnectionError,
     ConnectionSetupRequestError, ConnectionSetupRequestErrorKind, CqlEventHandlingError, DbError,
-    InternalRequestError, RequestAttemptError, ResponseParseError, SchemaAgreementError,
-    TranslationError, UseKeyspaceError,
+    InternalRequestError, RequestAttemptError, ResponseParseError, TranslationError,
+    UseKeyspaceError,
 };
 use crate::frame::protocol_features::ProtocolFeatures;
 use crate::frame::{
     self, FrameParams, SerializedRequest,
-    request::{self, SerializableRequest, batch, execute, query, register},
-    response::{Response, ResponseOpcode, event::Event, result},
-    server_event_type::EventType,
+    request::{self, SerializableRequest, batch, execute, query},
+    response::{ResponseOpcode, ResponseV2 as Response, event::EventV2 as Event, result},
+    server_event_type::EventTypeV2 as EventType,
 };
 use crate::policies::address_translator::{AddressTranslator, UntranslatedPeer};
 use crate::policies::timestamp_generator::TimestampGenerator;
@@ -33,12 +33,16 @@ use futures::{FutureExt, future::RemoteHandle};
 use scylla_cql::frame::frame_errors::CqlResponseParseError;
 use scylla_cql::frame::request::CqlRequestKind;
 use scylla_cql::frame::request::options::{self, Options};
+use scylla_cql::frame::request::query::QueryParameters;
+use scylla_cql::frame::request::register::RegisterV2 as Register;
 use scylla_cql::frame::response::authenticate::Authenticate;
 use scylla_cql::frame::response::result::{
     ResultMetadata, ResultWithDeserializedMetadata, TableSpec,
 };
 use scylla_cql::frame::response::{self, error};
-use scylla_cql::frame::response::{Error, ResponseWithDeserializedMetadata};
+use scylla_cql::frame::response::{
+    Error, ResponseWithDeserializedMetadataV2 as ResponseWithDeserializedMetadata,
+};
 use scylla_cql::frame::types::SerialConsistency;
 use scylla_cql::serialize::batch::{BatchValues, BatchValuesIterator};
 use scylla_cql::serialize::raw_batch::RawBatchValuesAdapter;
@@ -62,10 +66,6 @@ use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, error, trace, warn};
-use uuid::Uuid;
-
-// Queries for schema agreement
-const LOCAL_VERSION: &str = "SELECT schema_version FROM system.local WHERE key='local'";
 
 // FIXME: Make this constants configurable
 // The term "orphan" refers to stream ids, that were allocated for a {request, response} that no
@@ -102,6 +102,8 @@ pub(crate) struct Connection {
     config: HostConnectionConfig,
     features: ConnectionFeatures,
     router_handle: Arc<RouterHandle>,
+    #[cfg(test)]
+    socket: socket2::Socket,
 }
 
 struct RouterHandle {
@@ -265,6 +267,45 @@ impl<'id: 'map, 'map> SelfIdentity<'id> {
     }
 }
 
+/// Options for configuring the TCP socket used for a connection.
+///
+/// These options are applied to the socket before binding and connecting.
+#[derive(Clone, Debug)]
+pub(crate) struct TcpSocketOptions {
+    /// Whether to set the `TCP_NODELAY` flag on the socket.
+    pub(crate) nodelay: bool,
+
+    /// TCP keepalive interval — time after which the OS begins sending
+    /// keepalive probes on an idle connection. `None` disables TCP keepalive.
+    pub(crate) keepalive_interval: Option<Duration>,
+
+    /// Size of the TCP receive buffer (`SO_RCVBUF`). `None` keeps the OS default.
+    pub(crate) recv_buffer_size: Option<usize>,
+
+    /// Size of the TCP send buffer (`SO_SNDBUF`). `None` keeps the OS default.
+    pub(crate) send_buffer_size: Option<usize>,
+
+    /// Whether to set the `SO_REUSEADDR` socket option.
+    /// `None` keeps the OS default (typically `false`).
+    pub(crate) reuse_address: Option<bool>,
+
+    /// Linger duration (`SO_LINGER`). `None` keeps the OS default (disabled).
+    pub(crate) linger: Option<Duration>,
+}
+
+impl Default for TcpSocketOptions {
+    fn default() -> Self {
+        Self {
+            nodelay: true,
+            keepalive_interval: None,
+            recv_buffer_size: None,
+            send_buffer_size: None,
+            reuse_address: None,
+            linger: None,
+        }
+    }
+}
+
 /// Configuration used for new connections.
 ///
 /// Before being used for a particular connection, should be customized
@@ -275,13 +316,12 @@ pub(crate) struct ConnectionConfig {
     pub(crate) local_ip_address: Option<IpAddr>,
     pub(crate) shard_aware_local_port_range: ShardAwarePortRange,
     pub(crate) compression: Option<Compression>,
-    pub(crate) tcp_nodelay: bool,
-    pub(crate) tcp_keepalive_interval: Option<Duration>,
+    pub(crate) tcp_socket_options: TcpSocketOptions,
     pub(crate) timestamp_generator: Option<Arc<dyn TimestampGenerator>>,
     pub(crate) tls_provider: Option<TlsProvider>,
     pub(crate) connect_timeout: std::time::Duration,
     // should be Some only in control connections,
-    pub(crate) event_sender: Option<mpsc::Sender<Event>>,
+    pub(crate) event_sender: Option<(mpsc::Sender<Event>, Vec<EventType>)>,
     pub(crate) default_consistency: Consistency,
     pub(crate) authenticator: Option<Arc<dyn AuthenticatorProvider>>,
     pub(crate) address_translator: Option<Arc<dyn AddressTranslator>>,
@@ -309,8 +349,7 @@ impl ConnectionConfig {
             local_ip_address: self.local_ip_address,
             shard_aware_local_port_range: self.shard_aware_local_port_range.clone(),
             compression: self.compression,
-            tcp_nodelay: self.tcp_nodelay,
-            tcp_keepalive_interval: self.tcp_keepalive_interval,
+            tcp_socket_options: self.tcp_socket_options.clone(),
             timestamp_generator: self.timestamp_generator.clone(),
             tls_config,
             connect_timeout: self.connect_timeout,
@@ -335,13 +374,12 @@ pub(crate) struct HostConnectionConfig {
     pub(crate) local_ip_address: Option<IpAddr>,
     pub(crate) shard_aware_local_port_range: ShardAwarePortRange,
     pub(crate) compression: Option<Compression>,
-    pub(crate) tcp_nodelay: bool,
-    pub(crate) tcp_keepalive_interval: Option<Duration>,
+    pub(crate) tcp_socket_options: TcpSocketOptions,
     pub(crate) timestamp_generator: Option<Arc<dyn TimestampGenerator>>,
     pub(crate) tls_config: Option<TlsConfig>,
     pub(crate) connect_timeout: std::time::Duration,
     // should be Some only in control connections,
-    pub(crate) event_sender: Option<mpsc::Sender<Event>>,
+    pub(crate) event_sender: Option<(mpsc::Sender<Event>, Vec<EventType>)>,
     pub(crate) default_consistency: Consistency,
     pub(crate) authenticator: Option<Arc<dyn AuthenticatorProvider>>,
     pub(crate) address_translator: Option<Arc<dyn AddressTranslator>>,
@@ -361,8 +399,7 @@ impl Default for HostConnectionConfig {
             local_ip_address: None,
             shard_aware_local_port_range: ShardAwarePortRange::EPHEMERAL_PORT_RANGE,
             compression: None,
-            tcp_nodelay: true,
-            tcp_keepalive_interval: None,
+            tcp_socket_options: TcpSocketOptions::default(),
             timestamp_generator: None,
             event_sender: None,
             tls_config: None,
@@ -390,8 +427,7 @@ impl Default for ConnectionConfig {
             local_ip_address: None,
             shard_aware_local_port_range: ShardAwarePortRange::EPHEMERAL_PORT_RANGE,
             compression: None,
-            tcp_nodelay: true,
-            tcp_keepalive_interval: None,
+            tcp_socket_options: TcpSocketOptions::default(),
             timestamp_generator: None,
             event_sender: None,
             tls_provider: None,
@@ -421,6 +457,12 @@ impl HostConnectionConfig {
 // Used to listen for fatal error in connection
 pub(crate) type ErrorReceiver = tokio::sync::oneshot::Receiver<ConnectionError>;
 
+struct CachedMetadataParameters<'statement> {
+    cached_metadata: Option<&'statement Arc<ResultMetadata<'static>>>,
+    skip_metadata: bool,
+    result_metadata_id: Option<&'statement [u8]>,
+}
+
 impl Connection {
     // Returns new connection and ErrorReceiver which can be used to wait for a fatal error
     /// Opens a connection and makes it ready to send/receive CQL frames on it,
@@ -432,7 +474,12 @@ impl Connection {
     ) -> Result<(Self, ErrorReceiver), ConnectionError> {
         let stream_connector = tokio::time::timeout(
             config.connect_timeout,
-            connect_with_source_ip_and_port(connect_address, config.local_ip_address, source_port),
+            connect_with_source_ip_and_port(
+                connect_address,
+                config.local_ip_address,
+                source_port,
+                &config.tcp_socket_options,
+            ),
         )
         .await;
         let stream = match stream_connector {
@@ -441,11 +488,6 @@ impl Connection {
                 return Err(ConnectionError::ConnectTimeout);
             }
         };
-        stream.set_nodelay(config.tcp_nodelay)?;
-
-        if let Some(tcp_keepalive_interval) = config.tcp_keepalive_interval {
-            Self::setup_tcp_keepalive(&stream, tcp_keepalive_interval)?;
-        }
 
         // TODO: What should be the size of the channel?
         let (sender, receiver) = mpsc::channel(1024);
@@ -459,6 +501,12 @@ impl Connection {
             orphan_notification_sender,
         });
 
+        #[cfg(test)]
+        let socket = {
+            use std::os::unix::io::AsFd;
+            socket2::Socket::from(stream.as_fd().try_clone_to_owned()?)
+        };
+
         let _worker_handle = Self::run_router(
             config.clone(),
             stream,
@@ -466,7 +514,7 @@ impl Connection {
             error_sender,
             orphan_notification_receiver,
             router_handle.clone(),
-            connect_address.ip(),
+            connect_address,
         )
         .await?;
 
@@ -476,61 +524,11 @@ impl Connection {
             features: Default::default(),
             connect_address,
             router_handle,
+            #[cfg(test)]
+            socket,
         };
 
         Ok((connection, error_receiver))
-    }
-
-    fn setup_tcp_keepalive(
-        stream: &TcpStream,
-        tcp_keepalive_interval: Duration,
-    ) -> std::io::Result<()> {
-        // It may be surprising why we call `with_time()` with `tcp_keepalive_interval`
-        // and `with_interval() with some other value. This is due to inconsistent naming:
-        // our interval means time after connection becomes idle until keepalives
-        // begin to be sent (they call it "time"), and their interval is time between
-        // sending keepalives.
-        // We insist on our naming due to other drivers following the same convention.
-        let mut tcp_keepalive = TcpKeepalive::new().with_time(tcp_keepalive_interval);
-
-        // These cfg values are taken from socket2 library, which uses the same constraints.
-        #[cfg(any(
-            target_os = "android",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "fuchsia",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "netbsd",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "windows",
-        ))]
-        {
-            tcp_keepalive = tcp_keepalive.with_interval(Duration::from_secs(1));
-        }
-
-        #[cfg(any(
-            target_os = "android",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "fuchsia",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "netbsd",
-            target_os = "tvos",
-            target_os = "watchos",
-        ))]
-        {
-            tcp_keepalive = tcp_keepalive.with_retries(10);
-        }
-
-        let sf = SockRef::from(&stream);
-        sf.set_tcp_keepalive(&tcp_keepalive)
     }
 
     async fn startup(
@@ -705,9 +703,31 @@ impl Connection {
         }
 
         let response = raw_prepared.into_response();
-        if response.result_metadata.id().is_some()
-            && previous_prepared.get_current_result_metadata().id() != response.result_metadata.id()
-        {
+
+        if response.result_metadata.id().is_none() {
+            return Ok(());
+        }
+
+        let current_metadata = previous_prepared.get_current_result_metadata();
+
+        let non_destructive_update =
+            current_metadata.col_count() == 0 || response.result_metadata.col_count() != 0;
+        if !non_destructive_update {
+            // For some statements, real result metadata is only provided in response to EXECUTE.
+            // In PREPARED we just get NO_METADATA.
+            // The following is possible
+            //  - We PREPARE a statement, get id X and NO_METADATA
+            //  - We EXECUTE it with id X
+            //  - Server responds with id Y and real metadata
+            //  - Statement is cleared from the cache
+            //  - We reprepare, get id X again
+            //  - We replace metadata, throwing the useful one out.
+            // This condition is supposed to prevent that. I don't think there
+            // is any scenario where we want to replace non-empty metadata with empty metadata.
+            return Ok(());
+        }
+
+        if current_metadata.id() != response.result_metadata.id() {
             previous_prepared.update_current_result_metadata(Arc::new(response.result_metadata));
         }
 
@@ -822,12 +842,10 @@ impl Connection {
 
     pub(crate) async fn query_unpaged(
         &self,
-        statement: impl Into<Statement>,
+        statement: &Statement,
     ) -> Result<QueryResult, RequestAttemptError> {
         // This method is used only for driver internal queries, so no need to consult execution profile here.
-        let statement: Statement = statement.into();
-
-        self.query_raw_unpaged(&statement)
+        self.query_raw_unpaged(statement)
             .await
             .and_then(|response| {
                 response
@@ -893,12 +911,12 @@ impl Connection {
     async fn execute_raw_unpaged(
         &self,
         prepared: &PreparedStatement,
-        values: SerializedValues,
+        values: &SerializedValues,
     ) -> Result<QueryResponse, RequestAttemptError> {
         // This method is used only for driver internal queries, so no need to consult execution profile here.
         self.execute_raw_with_consistency(
             prepared,
-            &values,
+            values,
             prepared
                 .config
                 .determine_consistency(self.config.default_consistency),
@@ -917,10 +935,22 @@ impl Connection {
             rows_result,
         )) = &query_response.response
         {
-            if rows_result.0.metadata().id().is_some()
-                && rows_result.0.metadata().id()
-                    != prepared_statement.get_current_result_metadata().id()
-            {
+            // New metadata doesn't have id, so nothing to update.
+            if rows_result.0.metadata().id().is_none() {
+                return;
+            }
+
+            let current_metadata = prepared_statement.get_current_result_metadata();
+
+            let updated_id = rows_result.0.metadata().id() != current_metadata.id();
+            // If server sent us real ID in PREPARED, but sent us no metadata,
+            // we will send empty id in EXECUTE. This forces server to resend id, and metadata.
+            // In this case id will be the same, but there will be some columns.
+            let same_id_but_non_empty = (!updated_id)
+                && current_metadata.col_count() == 0
+                && rows_result.0.metadata().col_count() != 0;
+
+            if updated_id || same_id_but_non_empty {
                 // Metadata in response is either cached metadata extracted from statement, or a new extracted from response.
                 // If the id differs from the one in prepared statement, I see 2 possibilities:
                 // 1. Metadata changed, and was already updated on PreparedStatement by another execution.
@@ -933,24 +963,75 @@ impl Connection {
         }
     }
 
-    fn get_result_id<'metadata>(
-        cached_metadata: &'metadata Option<Arc<ResultMetadata<'static>>>,
-        has_metadata_extension: bool,
-    ) -> Option<&'metadata [u8]> {
-        // We want to send result metadata id if, and only if, metadata extension is enabled.
-        // The logic in the caller of this function forces `cached_metadata` to be `Some`. in that case.
-        // Here we need to extract metadata from Option, so we need to handle the case where it is None.
-        // and extension is enabled. The only way to handle it is a panic, because it is a clear bug in the driver.
-        match (cached_metadata.as_ref(), has_metadata_extension) {
-            // In the first branch we know that metadata extension is enabled, and we have extracted cached metadata.
-            // Can we `unwrap()` the id? I think not, because I see one scenario where it can be None.
-            // Statement may have been prepared on connection that does not have the extension (think:
-            // cluster during upgrade, with mixed versions), and then used on this connection.
-            // What to do in this case? We have to send some id, because it is not optional in the protocol,
-            // so let's send empty id.
-            (Some(metadata), true) => Some(metadata.id().unwrap_or(&[])),
-            (_, false) => None,
-            (None, true) => unreachable!("metadata extension enabled, but no cached metadata."),
+    fn calculate_cached_metadata_params<'statement>(
+        &self,
+        statement: &'statement PreparedStatement,
+        // We could extract it from the statement in this function, but result_metadata_id references
+        // such extracted metadata, leading to self-referential struct problem.
+        statement_metadata: &'statement Arc<ResultMetadata<'static>>,
+    ) -> CachedMetadataParameters<'statement> {
+        let has_metadata_extension = self.features.protocol_features.scylla_metadata_id_supported;
+        let skip_metadata = {
+            // If the metadata id extension is supported, there is usually no point in not caching metadata.
+            // There is one case where we still want to request new result metadata: if the current one has 0
+            // columns.
+            // It may be the case for INSERT statement which really doesn't return columns,
+            // but it may also be the case for statements like `LIST ROLES of` which don't return metadata
+            // in PREPARED, but return columns when executed. If we don't request metadata for those, we won't
+            // be able to deserialize them.
+            if statement_metadata.col_count() == 0 {
+                false
+            } else {
+                // If the cached metadata has some columns, and we do have the extension, then
+                // we can safely skip result metadata. Server will send it if our current metadata id is wrong.
+                statement.get_use_cached_result_metadata() || has_metadata_extension
+            }
+        };
+
+        // If we don't set `skip_metadata`, then there is no point in using cached metadata,
+        // because the server is obligated to send us one anyway.
+        // Using cached wouldn't impact the driver in any way, because the cached metadata is only used
+        // for deserialization, and ignored if server sent a new one.
+        // Ignoring it here just seems more correct and clear to me.
+        let cached_metadata = skip_metadata.then_some(statement_metadata);
+
+        let result_metadata_id =
+            // We want to send result metadata id if, and only if, metadata extension is enabled.
+            match (cached_metadata.as_ref(), has_metadata_extension) {
+                // In the first branch we know that metadata extension is enabled, and we are using cached metadata.
+                // Can we `unwrap()` the id? I think not, because I see one scenario where it can be None.
+                // Statement may have been prepared on connection that does not have the extension (think:
+                // cluster during upgrade, with mixed versions), and then used on this connection.
+                // What to do in this case? We have to send some id, because it is not optional in the protocol,
+                // so let's send empty id.
+                (Some(metadata), true) => Some(metadata.id().unwrap_or(&[])),
+                // Extension is not enabled. We must never send an id in this case.
+                (_, false) => None,
+                // Extension is enabled, but we are not using cached metadata!
+                // See definition of `skip_metadata`: this can happen if cached result metadata
+                // has 0 columns.
+                // We must send an id, and we have basically 2 options:
+                //  1. Id from current result metadata (or empty if not present)
+                //  2. Empty id
+                // I don't think it matters a lot which choice we make here.
+                //  - Not sending ID should be a small bit cheaper for INSERTs, because we send less data.
+                //  - Scylla currently has slightly weird implementation of ID for some statements,
+                //    notable `LIST ROLES of`. In PREPARED, it sends NO_METADATA, and some result metadata id
+                //    (which is a result of hashing empty string). In response to EXECUTE made with such ID,
+                //    it will not send a new id, and will not send metadata (unless skip_metadata=false).
+                //    Cassandra has a more reasonable approach to this. More details in:
+                //     - https://github.com/scylladb/scylla-rust-driver/issues/1575#issuecomment-3990545877
+                //     - https://github.com/scylladb/scylla-rust-driver/issues/1575#issuecomment-3990812038
+                //    Sending empty id will force Scylla to resend id alongside metadata, giving us a chance to update
+                //    it, and use it for subsequent executions.
+                //    This isn't very important, `LIST ROLES of` performance doesn't matter, so its not a strong argument.
+                (None, true) => Some(&[] as &[u8]),
+            };
+
+        CachedMetadataParameters {
+            cached_metadata,
+            skip_metadata,
+            result_metadata_id,
         }
     }
 
@@ -973,28 +1054,20 @@ impl Connection {
             .get_timestamp()
             .or_else(get_timestamp_from_gen);
 
-        let has_metadata_extension = self.features.protocol_features.scylla_metadata_id_supported;
-
-        // If the metadata id extension is supported, there is no point in not caching metadata,
-        // so we ignore the setting on prepared statement.
-        let skip_metadata =
-            prepared_statement.get_use_cached_result_metadata() || has_metadata_extension;
-
-        let cached_metadata =
-            skip_metadata.then(|| prepared_statement.get_current_result_metadata());
-
-        let result_id = Self::get_result_id(&cached_metadata, has_metadata_extension);
+        let current_result_metadata = prepared_statement.get_current_result_metadata();
+        let cached_metadata_params =
+            self.calculate_cached_metadata_params(prepared_statement, &current_result_metadata);
 
         let execute_frame = execute::ExecuteV2 {
             id: prepared_statement.get_id().as_ref().into(),
-            result_metadata_id: result_id.map(Into::into),
+            result_metadata_id: cached_metadata_params.result_metadata_id.map(Into::into),
             parameters: query::QueryParameters {
                 consistency,
                 serial_consistency,
                 values: Cow::Borrowed(values),
                 page_size: page_size.map(Into::into),
                 timestamp,
-                skip_metadata,
+                skip_metadata: cached_metadata_params.skip_metadata,
                 paging_state,
             },
         };
@@ -1004,17 +1077,16 @@ impl Connection {
                 &execute_frame,
                 true,
                 prepared_statement.config.tracing,
-                cached_metadata.as_ref(),
+                cached_metadata_params.cached_metadata,
             )
             .await?;
 
-        if let Some(spec) = prepared_statement.get_table_spec() {
-            if let Err(e) = self
+        if let Some(spec) = prepared_statement.get_table_spec()
+            && let Err(e) = self
                 .update_tablets_from_response(spec, &query_response)
                 .await
-            {
-                tracing::warn!("Error while parsing tablet info from custom payload: {}", e);
-            }
+        {
+            tracing::warn!("Error while parsing tablet info from custom payload: {}", e);
         }
 
         Self::handle_result_metadata_new_id(prepared_statement, &query_response);
@@ -1032,28 +1104,31 @@ impl Connection {
                 self.reprepare(prepared_statement.get_statement(), prepared_statement)
                     .await?;
                 // Metadata may have changed in reprepare, or in some concurrent execution
-                let cached_metadata =
-                    skip_metadata.then(|| prepared_statement.get_current_result_metadata());
-                let result_id = Self::get_result_id(&cached_metadata, has_metadata_extension);
+                let current_result_metadata = prepared_statement.get_current_result_metadata();
+                let cached_metadata_params = self
+                    .calculate_cached_metadata_params(prepared_statement, &current_result_metadata);
                 let new_response = self
                     .send_request(
                         &execute::ExecuteV2 {
-                            result_metadata_id: result_id.map(Into::into),
+                            result_metadata_id: cached_metadata_params
+                                .result_metadata_id
+                                .map(Into::into),
+                            parameters: QueryParameters {
+                                skip_metadata: cached_metadata_params.skip_metadata,
+                                ..execute_frame.parameters
+                            },
                             ..execute_frame
                         },
                         true,
                         prepared_statement.config.tracing,
-                        cached_metadata.as_ref(),
+                        cached_metadata_params.cached_metadata,
                     )
                     .await?;
 
-                if let Some(spec) = prepared_statement.get_table_spec() {
-                    if let Err(e) = self.update_tablets_from_response(spec, &new_response).await {
-                        tracing::warn!(
-                            "Error while parsing tablet info from custom payload: {}",
-                            e
-                        );
-                    }
+                if let Some(spec) = prepared_statement.get_table_spec()
+                    && let Err(e) = self.update_tablets_from_response(spec, &new_response).await
+                {
+                    tracing::warn!("Error while parsing tablet info from custom payload: {}", e);
                 }
 
                 Self::handle_result_metadata_new_id(prepared_statement, &new_response);
@@ -1064,24 +1139,12 @@ impl Connection {
         }
     }
 
-    /// Executes a query and fetches its results over multiple pages, using
-    /// the asynchronous iterator interface.
-    pub(crate) async fn query_iter(
-        self: Arc<Self>,
-        query: Statement,
-    ) -> Result<QueryPager, NextRowError> {
-        let consistency = query
-            .config
-            .determine_consistency(self.config.default_consistency);
-        let serial_consistency = query.config.serial_consistency.flatten();
-
-        QueryPager::new_for_connection_query_iter(query, self, consistency, serial_consistency)
-            .await
-            .map_err(NextRowError::NextPageError)
-    }
-
     /// Executes a prepared statements and fetches its results over multiple pages, using
     /// the asynchronous iterator interface.
+    ///
+    /// NOTE: This function only supports executing SELECT statements.
+    /// More specifically, it expects that each response is of Rows kind.
+    /// Other kinds of responses will result in an error.
     pub(crate) async fn execute_iter(
         self: Arc<Self>,
         prepared_statement: PreparedStatement,
@@ -1277,7 +1340,7 @@ impl Connection {
             ConnectionSetupRequestError::new(CqlRequestKind::Register, kind)
         };
 
-        let register_frame = register::Register {
+        let register_frame = Register {
             event_types_to_register_for,
         };
 
@@ -1308,18 +1371,6 @@ impl Connection {
                 }
             },
         }
-    }
-
-    pub(crate) async fn fetch_schema_version(&self) -> Result<Uuid, SchemaAgreementError> {
-        let (version_id,) = self
-            .query_unpaged(LOCAL_VERSION)
-            .await?
-            .into_rows_result()
-            .map_err(SchemaAgreementError::TracesEventsIntoRowsResultError)?
-            .single_row::<(Uuid,)>()
-            .map_err(SchemaAgreementError::SingleRowError)?;
-
-        Ok(version_id)
     }
 
     async fn send_request(
@@ -1397,7 +1448,7 @@ impl Connection {
         error_sender: tokio::sync::oneshot::Sender<ConnectionError>,
         orphan_notification_receiver: mpsc::UnboundedReceiver<RequestId>,
         router_handle: Arc<RouterHandle>,
-        node_address: IpAddr,
+        node_address: SocketAddr,
     ) -> Result<RemoteHandle<()>, std::io::Error> {
         async fn spawn_router_and_get_handle(
             config: HostConnectionConfig,
@@ -1406,7 +1457,7 @@ impl Connection {
             error_sender: tokio::sync::oneshot::Sender<ConnectionError>,
             orphan_notification_receiver: mpsc::UnboundedReceiver<RequestId>,
             router_handle: Arc<RouterHandle>,
-            node_address: IpAddr,
+            node_address: SocketAddr,
         ) -> RemoteHandle<()> {
             let (task, handle) = Connection::router(
                 config,
@@ -1427,7 +1478,10 @@ impl Connection {
             #[allow(unreachable_code)]
             match tls_config.new_tls()? {
                 #[cfg(feature = "openssl-010")]
-                crate::network::tls::Tls::OpenSsl010(ssl) => {
+                crate::network::tls::Tls::OpenSsl010(mut ssl) => {
+                    ssl.param_mut()
+                        .set_ip(node_address.ip())
+                        .map_err(crate::network::tls::TlsError::OpenSsl010)?;
                     let mut stream = tokio_openssl::SslStream::new(ssl, stream)
                         .map_err(crate::network::tls::TlsError::OpenSsl010)?;
                     std::pin::Pin::new(&mut stream)
@@ -1448,7 +1502,7 @@ impl Connection {
                 #[cfg(feature = "rustls-023")]
                 crate::network::tls::Tls::Rustls023 { connector } => {
                     use rustls::pki_types::ServerName;
-                    let server_name = ServerName::IpAddress(node_address.into());
+                    let server_name = ServerName::IpAddress(node_address.ip().into());
                     let stream = connector.connect(server_name, stream).await?;
                     return Ok(spawn_router_and_get_handle(
                         config,
@@ -1483,7 +1537,7 @@ impl Connection {
         error_sender: tokio::sync::oneshot::Sender<ConnectionError>,
         orphan_notification_receiver: mpsc::UnboundedReceiver<RequestId>,
         router_handle: Arc<RouterHandle>,
-        node_address: IpAddr,
+        node_address: SocketAddr,
     ) {
         let (read_half, write_half) = split(stream);
         // Why are we using a mutex here?
@@ -1512,7 +1566,7 @@ impl Connection {
         let r = Self::reader(
             BufReader::with_capacity(8192, read_half),
             &handler_map,
-            config.event_sender,
+            config.event_sender.map(|(sender, _)| sender),
             config.compression,
         );
         let w = Self::writer(
@@ -1727,7 +1781,7 @@ impl Connection {
         router_handle: Arc<RouterHandle>,
         keepalive_interval: Option<Duration>,
         keepalive_timeout: Option<Duration>,
-        node_address: IpAddr, // This address is only used to enrich the log messages
+        node_address: SocketAddr, // This address is only used to enrich the log messages
     ) -> Result<(), BrokenConnectionError> {
         async fn issue_keepalive_query(
             router_handle: &RouterHandle,
@@ -1760,9 +1814,10 @@ impl Connection {
                                 "Timed out while waiting for response to keepalive request on connection to node {}",
                                 node_address
                             );
-                            return Err(
-                                BrokenConnectionErrorKind::KeepaliveTimeout(node_address).into()
-                            );
+                            return Err(BrokenConnectionErrorKind::KeepaliveTimeout(
+                                node_address.ip(),
+                            )
+                            .into());
                         }
                     }
                 } else {
@@ -1874,44 +1929,64 @@ impl Connection {
 
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn get_sock_ref(&self) -> socket2::SockRef<'_> {
+        socket2::SockRef::from(&self.socket)
+    }
 }
 
 async fn maybe_translated_addr(
     endpoint: &UntranslatedEndpoint,
     address_translator: Option<&dyn AddressTranslator>,
 ) -> Result<SocketAddr, TranslationError> {
-    match *endpoint {
-        UntranslatedEndpoint::ContactPoint(ref addr) => Ok(addr.address),
-        UntranslatedEndpoint::Peer(PeerEndpoint {
-            host_id,
-            address,
-            ref datacenter,
-            ref rack,
-        }) => match address {
-            NodeAddr::Translatable(addr) => {
-                // In this case, addr is subject to AddressTranslator.
-                if let Some(translator) = address_translator {
-                    let res = translator
-                        .translate_address(&UntranslatedPeer {
-                            host_id,
-                            untranslated_address: addr,
-                            datacenter: datacenter.as_deref(),
-                            rack: rack.as_deref(),
-                        })
-                        .await;
-                    if let Err(ref err) = res {
-                        error!("Address translation failed for addr {}: {}", addr, err);
-                    }
-                    res
-                } else {
-                    Ok(addr)
-                }
-            }
-            NodeAddr::Untranslatable(addr) => {
-                // In this case, addr is considered to be translated, as it is the control connection's address.
-                Ok(addr)
-            }
-        },
+    match (endpoint, address_translator) {
+        (UntranslatedEndpoint::ContactPoint(addr), _) => {
+            // Contact points' addresses are not intended to be translated.
+            Ok(addr.address)
+        }
+
+        (
+            UntranslatedEndpoint::Peer(PeerEndpoint { address, .. }),
+            None, // no translator
+        ) => {
+            // No translator -> no translation.
+            Ok(address.into_inner())
+        }
+
+        (
+            UntranslatedEndpoint::Peer(PeerEndpoint {
+                address: NodeAddr::Untranslatable(addr),
+                ..
+            }),
+            _,
+        ) => {
+            // Untranslatable address -> no translation.
+            Ok(*addr)
+        }
+
+        (
+            UntranslatedEndpoint::Peer(PeerEndpoint {
+                host_id,
+                address: NodeAddr::Translatable(addr),
+                datacenter,
+                rack,
+            }),
+            Some(translator),
+        ) => {
+            // In this case, addr is subject to AddressTranslator.
+            translator
+                .translate_address(&UntranslatedPeer {
+                    host_id: *host_id,
+                    untranslated_address: *addr,
+                    datacenter: datacenter.as_deref(),
+                    rack: rack.as_deref(),
+                })
+                .await
+                .inspect_err(|err| {
+                    error!("Address translation failed for addr {}: {}", addr, err);
+                })
+        }
     }
 }
 
@@ -2027,13 +2102,8 @@ pub(crate) async fn open_connection(
     }
 
     /* If this is a control connection, REGISTER to receive all event types. */
-    if connection.config.event_sender.is_some() {
-        let all_event_types = vec![
-            EventType::TopologyChange,
-            EventType::StatusChange,
-            EventType::SchemaChange,
-        ];
-        connection.register(all_event_types).await?;
+    if let Some((_, ref event_types)) = connection.config.event_sender {
+        connection.register(event_types.clone()).await?;
     }
 
     Ok((connection, error_receiver))
@@ -2066,6 +2136,7 @@ async fn connect_with_source_ip_and_port(
     connect_address: SocketAddr,
     source_ip: Option<IpAddr>,
     source_port: Option<u16>,
+    socket_options: &TcpSocketOptions,
 ) -> Result<TcpStream, std::io::Error> {
     // Binding to port 0 is equivalent to choosing random ephemeral port.
     let source_port = source_port.unwrap_or(0);
@@ -2075,6 +2146,7 @@ async fn connect_with_source_ip_and_port(
             // If source_ip not provided, bind to INADDR_ANY.
             let source_ipv4 = source_ip.unwrap_or(Ipv4Addr::UNSPECIFIED.into());
             let socket = TcpSocket::new_v4()?;
+            apply_socket_options(&socket, socket_options)?;
             socket.bind(SocketAddr::new(source_ipv4, source_port))?;
             Ok(socket.connect(connect_address).await?)
         }
@@ -2082,10 +2154,90 @@ async fn connect_with_source_ip_and_port(
             // If source_ip not provided, bind to in6addr_any.
             let source_ipv6 = source_ip.unwrap_or(Ipv6Addr::UNSPECIFIED.into());
             let socket = TcpSocket::new_v6()?;
+            apply_socket_options(&socket, socket_options)?;
             socket.bind(SocketAddr::new(source_ipv6, source_port))?;
             Ok(socket.connect(connect_address).await?)
         }
     }
+}
+
+/// Applies all TCP socket options to the socket before bind/connect.
+///
+/// Uses Tokio's built-in `TcpSocket` methods where possible. TCP keepalive
+/// and `SO_LINGER` are configured via `socket2` since Tokio does not expose a
+/// keepalive API on `TcpSocket`, and `TcpSocket::set_linger` is deprecated.
+fn apply_socket_options(
+    socket: &TcpSocket,
+    options: &TcpSocketOptions,
+) -> Result<(), std::io::Error> {
+    if let Some(reuse) = options.reuse_address {
+        socket.set_reuseaddr(reuse)?;
+    }
+    socket.set_nodelay(options.nodelay)?;
+    if let Some(recv_buf) = options.recv_buffer_size {
+        socket.set_recv_buffer_size(recv_buf as u32)?;
+    }
+    if let Some(send_buf) = options.send_buffer_size {
+        socket.set_send_buffer_size(send_buf as u32)?;
+    }
+
+    let sf = SockRef::from(&socket);
+    if let Some(linger) = options.linger {
+        #[expect(deprecated)]
+        socket.set_linger(Some(linger))?;
+    }
+    if let Some(keepalive_interval) = options.keepalive_interval {
+        setup_tcp_keepalive(&sf, keepalive_interval)?;
+    }
+    Ok(())
+}
+
+fn setup_tcp_keepalive(sf: &SockRef<'_>, tcp_keepalive_interval: Duration) -> std::io::Result<()> {
+    // It may be surprising why we call `with_time()` with `tcp_keepalive_interval`
+    // and `with_interval() with some other value. This is due to inconsistent naming:
+    // our interval means time after connection becomes idle until keepalives
+    // begin to be sent (they call it "time"), and their interval is time between
+    // sending keepalives.
+    // We insist on our naming due to other drivers following the same convention.
+    let mut tcp_keepalive = TcpKeepalive::new().with_time(tcp_keepalive_interval);
+
+    // These cfg values are taken from socket2 library, which uses the same constraints.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+    ))]
+    {
+        tcp_keepalive = tcp_keepalive.with_interval(Duration::from_secs(1));
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+    ))]
+    {
+        tcp_keepalive = tcp_keepalive.with_retries(10);
+    }
+
+    sf.set_tcp_keepalive(&tcp_keepalive)
 }
 
 struct OrphanageTracker {
@@ -2312,6 +2464,7 @@ mod tests {
         LWT_OPTIMIZATION_META_BIT_MASK_KEY, SCYLLA_LWT_ADD_METADATA_MARK_EXTENSION,
     };
     use scylla_cql::frame::types;
+    use scylla_cql::serialize::row::SerializedValues;
     use scylla_proxy::{
         Condition, Node, Proxy, Reaction, RequestFrame, RequestOpcode, RequestReaction,
         RequestRule, ResponseFrame, ShardAwareness,
@@ -2332,17 +2485,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Tests for Connection::query_iter
+    /// Tests for Connection::execute_iter
     /// 1. SELECT from an empty table.
     /// 2. Create table and insert ints 0..100.
-    ///    Then use query_iter with page_size set to 7 to select all 100 rows.
-    /// 3. INSERT query_iter should work and not return any rows.
+    ///    Then use execute_iter with page_size set to 7 to select all 100 rows.
+    /// 3. INSERT execute_iter should work and not return any rows.
     #[tokio::test]
-    async fn connection_query_iter_test() {
+    async fn connection_execute_iter_test() {
         use crate::client::session_builder::SessionBuilder;
 
         setup_tracing();
-        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "172.42.0.2:9042".to_string());
         let addr: SocketAddr = resolve_hostname(&uri).await;
 
         let (connection, _) = super::open_connection(
@@ -2366,11 +2519,11 @@ mod tests {
             session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks.clone())).await.unwrap();
             session.use_keyspace(ks.clone(), false).await.unwrap();
             session
-                .ddl("DROP TABLE IF EXISTS connection_query_iter_tab")
+                .ddl("DROP TABLE IF EXISTS connection_execute_iter_tab")
                 .await
                 .unwrap();
             session
-                .ddl("CREATE TABLE IF NOT EXISTS connection_query_iter_tab (p int primary key)")
+                .ddl("CREATE TABLE IF NOT EXISTS connection_execute_iter_tab (p int primary key)")
                 .await
                 .unwrap();
         }
@@ -2382,10 +2535,11 @@ mod tests {
 
         // 1. SELECT from an empty table returns query result where rows are Some(Vec::new())
         let select_query =
-            Statement::new("SELECT p FROM connection_query_iter_tab").with_page_size(7);
+            Statement::new("SELECT p FROM connection_execute_iter_tab").with_page_size(7);
+        let prepared_select = connection.prepare(&select_query).await.unwrap();
         let empty_res = connection
             .clone()
-            .query_iter(select_query.clone())
+            .execute_iter(prepared_select.clone(), SerializedValues::new())
             .await
             .unwrap()
             .rows_stream::<(i32,)>()
@@ -2395,15 +2549,17 @@ mod tests {
             .unwrap();
         assert!(empty_res.is_empty());
 
-        // 2. Insert 100 and select using query_iter with page_size 7
+        // 2. Insert 100 and select using execute_iter with page_size 7
         let values: Vec<i32> = (0..100).collect();
-        let insert_query = Statement::new("INSERT INTO connection_query_iter_tab (p) VALUES (?)")
+        let insert_query = Statement::new("INSERT INTO connection_execute_iter_tab (p) VALUES (?)")
             .with_page_size(7);
         let prepared = connection.prepare(&insert_query).await.unwrap();
         let mut insert_futures = Vec::new();
         for v in &values {
-            let values = prepared.serialize_values(&(*v,)).unwrap();
-            let fut = async { connection.execute_raw_unpaged(&prepared, values).await };
+            let fut = async {
+                let values = prepared.serialize_values(&(*v,)).unwrap();
+                connection.execute_raw_unpaged(&prepared, &values).await
+            };
             insert_futures.push(fut);
         }
 
@@ -2411,7 +2567,7 @@ mod tests {
 
         let mut results: Vec<i32> = connection
             .clone()
-            .query_iter(select_query.clone())
+            .execute_iter(prepared_select, SerializedValues::new())
             .await
             .unwrap()
             .rows_stream::<(i32,)>()
@@ -2421,20 +2577,6 @@ mod tests {
             .await;
         results.sort_unstable(); // Clippy recommended to use sort_unstable instead of sort()
         assert_eq!(results, values);
-
-        // 3. INSERT query_iter should work and not return any rows.
-        let insert_res1 = connection
-            .query_iter(Statement::new(
-                "INSERT INTO connection_query_iter_tab (p) VALUES (0)",
-            ))
-            .await
-            .unwrap()
-            .rows_stream::<()>()
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert!(insert_res1.is_empty());
 
         {
             // Teardown phase
@@ -2455,7 +2597,7 @@ mod tests {
         // to trigger the coalescing logic and check that everything works fine
         // no matter whether coalescing is enabled or not.
 
-        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "172.42.0.2:9042".to_string());
         let addr: SocketAddr = resolve_hostname(&uri).await;
         let ks = unique_keyspace_name();
 
@@ -2513,7 +2655,7 @@ mod tests {
                                 .serialize_values(&(j, vec![j as u8; j as usize]))
                                 .unwrap();
                             let response =
-                                conn.execute_raw_unpaged(&prepared, values).await.unwrap();
+                                conn.execute_raw_unpaged(&prepared, &values).await.unwrap();
                             // QueryResponse might contain an error - make sure that there were no errors
                             let _nonerror_response =
                                 response.into_non_error_query_response().unwrap();
@@ -2530,7 +2672,7 @@ mod tests {
             // Check that everything was written properly
             let range_end = arithmetic_sequence_sum(NUM_BATCHES);
             let mut results = connection
-                .query_unpaged("SELECT p, v FROM t")
+                .query_unpaged(&"SELECT p, v FROM t".into())
                 .await
                 .unwrap()
                 .into_rows_result()
@@ -2659,14 +2801,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ntest::timeout(20000)]
     async fn connection_is_closed_on_no_response_to_keepalives() {
         use crate::errors::BrokenConnectionErrorKind;
 
         setup_tracing();
 
         let proxy_addr = SocketAddr::new(scylla_proxy::get_exclusive_local_address(), 9042);
-        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "172.42.0.2:9042".to_string());
         let node_addr: SocketAddr = resolve_hostname(&uri).await;
 
         let drop_options_rule = RequestRule(
@@ -2707,7 +2848,7 @@ mod tests {
         // As everything is normal, these queries should succeed.
         for _ in 0..3 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            conn.query_unpaged("SELECT host_id FROM system.local WHERE key='local'")
+            conn.query_unpaged(&"SELECT host_id FROM system.local WHERE key='local'".into())
                 .await
                 .unwrap();
         }
@@ -2731,9 +2872,113 @@ mod tests {
 
         // As the router is invalidated, all further queries should immediately
         // return error.
-        conn.query_unpaged("SELECT host_id FROM system.local WHERE key='local'")
+        conn.query_unpaged(&"SELECT host_id FROM system.local WHERE key='local'".into())
             .await
             .unwrap_err();
+
+        let _ = proxy.finish().await;
+    }
+
+    /// Verifies that setting tcp_recv_buffer_size, tcp_send_buffer_size, tcp_linger, and
+    /// tcp_reuse_address on the builder are propagated correctly all the way to the
+    /// underlying socket and do not prevent the driver from establishing a connection.
+    #[tokio::test]
+    async fn tcp_socket_options_do_not_break_connection() {
+        use crate::client::session_builder::SessionBuilder;
+
+        setup_tracing();
+
+        const RECV_BUFFER_SIZE: usize = 131_072;
+        const SEND_BUFFER_SIZE: usize = 65_536;
+        const LINGER_DUR: Duration = Duration::from_secs(42);
+
+        let proxy_addr = SocketAddr::new(scylla_proxy::get_exclusive_local_address(), 9042);
+
+        // A dry-mode proxy that allows finishing creation of a Session.
+        // It performs the whole handshake on all connections, but responds to all
+        // QUERY, PREPARE and EXECUTE requests with an error.
+        let proxy_rules = vec![
+            RequestRule(
+                Condition::RequestOpcode(RequestOpcode::Options),
+                RequestReaction::forge_response(Arc::new(move |frame: RequestFrame| {
+                    ResponseFrame::forged_supported(frame.params, &HashMap::default()).unwrap()
+                })),
+            ),
+            RequestRule(
+                Condition::or(
+                    Condition::RequestOpcode(RequestOpcode::Startup),
+                    Condition::RequestOpcode(RequestOpcode::Register),
+                ),
+                RequestReaction::forge_response(Arc::new(move |frame: RequestFrame| {
+                    ResponseFrame::forged_ready(frame.params)
+                })),
+            ),
+            RequestRule(
+                Condition::any([
+                    Condition::RequestOpcode(RequestOpcode::Query),
+                    Condition::RequestOpcode(RequestOpcode::Prepare),
+                    Condition::RequestOpcode(RequestOpcode::Execute),
+                ]),
+                RequestReaction::forge().server_error(),
+            ),
+        ];
+
+        let proxy = Proxy::builder()
+            .with_node(
+                Node::builder()
+                    .proxy_address(proxy_addr)
+                    .request_rules(proxy_rules)
+                    .build_dry_mode(),
+            )
+            .build()
+            .run()
+            .await
+            .unwrap();
+
+        #[expect(deprecated)]
+        let session = SessionBuilder::new()
+            .known_node_addr(proxy_addr)
+            .tcp_recv_buffer_size(RECV_BUFFER_SIZE)
+            .tcp_send_buffer_size(SEND_BUFFER_SIZE)
+            .tcp_linger(LINGER_DUR)
+            .tcp_reuse_address(true)
+            .build()
+            .await
+            .unwrap();
+
+        let connection = session
+            .get_cluster_state()
+            .all_nodes
+            .first()
+            .unwrap()
+            .get_random_connection()
+            .unwrap();
+
+        let sock_ref = connection.get_sock_ref();
+
+        // Linux kernel doubles SO_RCVBUF and SO_SNDBUF values,
+        // so we check that the actual buffer sizes are at least as large as the requested ones.
+        assert!(
+            sock_ref
+                .recv_buffer_size()
+                .expect("failed to read SO_RCVBUF")
+                >= RECV_BUFFER_SIZE
+        );
+        assert!(
+            sock_ref
+                .send_buffer_size()
+                .expect("failed to read SO_SNDBUF")
+                >= SEND_BUFFER_SIZE
+        );
+        assert_eq!(
+            sock_ref.linger().expect("failed to read SO_LINGER"),
+            Some(LINGER_DUR)
+        );
+        assert!(
+            sock_ref
+                .reuse_address()
+                .expect("failed to read SO_REUSEADDR")
+        );
 
         let _ = proxy.finish().await;
     }

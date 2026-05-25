@@ -1,8 +1,8 @@
 [package]
 name = "scylla"
-version = "1.4.1"
+version = "1.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Async CQL driver for Rust, optimized for ScyllaDB, fully compatible with Apache Cassandra™"
 repository = "https://github.com/scylladb/scylla-rust-driver"
 readme = "../README.md"
@@ -14,6 +14,23 @@ license = "MIT OR Apache-2.0"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[package.metadata.cargo-semver-checks.lints]
+workspace = true
+
+[lints.rust]
+unnameable_types = "warn"
+unreachable_pub = "warn"
+missing-docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(scylla_unstable)',
+    'cfg(cassandra_tests)',
+] }
+
+[[bench]]
+name = "benchmark"
+harness = false
+required-features = ["unstable-testing"]
+
 [features]
 default = []
 # Enables TLS support via OpenSSL 0.10.
@@ -22,6 +39,8 @@ openssl-010 = ["dep:tokio-openssl", "dep:openssl"]
 rustls-023 = ["dep:tokio-rustls", "dep:rustls"]
 # Enables support for CQL ser/de of Secrecy type from secrecy 0.8 crate.
 secrecy-08 = ["scylla-cql/secrecy-08"]
+# Enables support for CQL ser/de of Secrecy type from secrecy 0.10 crate.
+secrecy-10 = ["scylla-cql/secrecy-10"]
 # Enables support for CQL ser/de of time/date types from chrono 0.4 crate.
 chrono-04 = ["scylla-cql/chrono-04"]
 # Enables support for CQL ser/de of time/date types from time 0.3 crate.
@@ -37,20 +56,35 @@ full-serialization = [
     "chrono-04",
     "time-03",
     "secrecy-08",
+    "secrecy-10",
     "num-bigint-03",
     "num-bigint-04",
     "bigdecimal-04",
 ]
 # Enables collection of internal driver metrics.
 metrics = ["dep:histogram"]
+
+### UNSTABLE FEATURES ###
 # Opts-in to various unstable testing features.
 unstable-testing = []
+# Enables features for use in CPP-RS Driver.
+unstable-cpp-rs = []
+# Enables features for use in Node.js-RS Driver.
+unstable-nodejs-rs = ["scylla-cql/unstable-nodejs-rs"]
+# Enables HostListener experimental support.
+unstable-host-listener = []
+# Enables unstable reconnection policy configuration.
+unstable-reconnect-policy = []
+# Enables fetching contents of the `system.client_routes` table.
+# Needed for custom routing (AWS PrivateLink, GCP PSC, etc.).
+unstable-client-routes = []
+
 
 [dependencies]
 ###########################
 # Main, public dependencies
 ###########################
-scylla-cql = { version = "1.4.0", path = "../scylla-cql" }
+scylla-cql = { version = "1.6.0", path = "../scylla-cql" }
 tokio = { version = "1.40", features = [
     "net",
     "time",
@@ -117,8 +151,7 @@ smallvec = "1.8.0"
 num-bigint-03 = { package = "num-bigint", version = "0.3" }
 num-bigint-04 = { package = "num-bigint", version = "0.4" }
 bigdecimal-04 = { package = "bigdecimal", version = "0.4" }
-scylla-proxy = { version = "0.0.5", path = "../scylla-proxy" }
-ntest = "0.9.3"
+scylla-proxy = { version = "0.0.6", path = "../scylla-proxy" }
 criterion = "0.6"
 tokio = { version = "1.34", features = ["test-util", "process", "fs"] }
 tracing-subscriber = { version = "0.3.14", features = ["env-filter"] }
@@ -128,23 +161,5 @@ time = "0.3"
 anyhow = "1.0.98"
 tempfile = "3.19"
 rcgen = "0.14"
-
-
-[[bench]]
-name = "benchmark"
-harness = false
-required-features = ["unstable-testing"]
-
-[lints.rust]
-unnameable_types = "warn"
-unreachable_pub = "warn"
-missing-docs = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(cassandra_tests)',
-    'cfg(cpp_rust_unstable)',
-    'cfg(nodejs_rs_unstable)',
-    'cfg(ccm_tests)',
-] }
-
-[package.metadata.cargo-semver-checks.lints]
-workspace = true
+uuid = { version = "1.0", features = ["v1"] }
+env_logger = "0.11"

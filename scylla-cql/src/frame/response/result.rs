@@ -839,7 +839,7 @@ impl DeserializedMetadataAndRawRows {
 
     /// Allows to retrieve raw rows, without the need for deserialization
     /// Intended to be used only in nodejs-rs driver only.
-    #[cfg(nodejs_rs_unstable)]
+    #[cfg(all(scylla_unstable, feature = "unstable-nodejs-rs"))]
     pub fn raw_rows(&self) -> &Bytes {
         &self.raw_rows
     }
@@ -1330,8 +1330,7 @@ fn deser_prepared_metadata(
     for i in 0..pk_count {
         pk_indexes.push(PartitionKeyIndex {
             index: types::read_short(buf)
-                .map_err(|err| PreparedMetadataParseError::PkIndexParseError(err.into()))?
-                as u16,
+                .map_err(|err| PreparedMetadataParseError::PkIndexParseError(err.into()))?,
             sequence: i as u16,
         });
     }
